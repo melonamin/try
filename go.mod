@@ -1,4 +1,4 @@
-module try
+module github.com/melonamin/try
 
 go 1.24.2
 
