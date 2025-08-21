@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -44,8 +45,9 @@ type model struct {
 }
 
 type selection struct {
-	Type string
-	Path string
+	Type     string
+	Path     string
+	CloneURL string // For clone operations
 }
 
 var (
@@ -348,6 +350,136 @@ func isAlphaNum(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 }
 
+// isValidSearchInput checks if the input string contains only valid characters for search
+func isValidSearchInput(input string) bool {
+	for _, char := range input {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || 
+			char == '-' || char == '_' || char == '.' || char == ' ' ||
+			char == ':' || char == '/' || char == '@') {
+			return false
+		}
+	}
+	return len(input) > 0
+}
+
+// Pre-compiled GitHub URL patterns
+var githubPatterns = []struct {
+	regex  *regexp.Regexp
+	format string
+}{
+	{regexp.MustCompile(`^https?://github\.com/([\w-]+)/([\w\.-]+?)(?:\.git)?/?$`), "https://github.com/$1/$2.git"},
+	{regexp.MustCompile(`^github\.com/([\w-]+)/([\w\.-]+?)(?:\.git)?/?$`), "https://github.com/$1/$2.git"},
+	{regexp.MustCompile(`^git@github\.com:([\w-]+)/([\w\.-]+?)(?:\.git)?$`), "https://github.com/$1/$2.git"},
+	{regexp.MustCompile(`^gh:([\w-]+)/([\w\.-]+?)$`), "https://github.com/$1/$2.git"},
+}
+
+// isGitHubURL checks if the text is a GitHub URL and returns normalized clone URL
+func isGitHubURL(text string) (bool, string) {
+	text = strings.TrimSpace(text)
+	
+	for _, p := range githubPatterns {
+		if matches := p.regex.FindStringSubmatch(text); matches != nil {
+			user := matches[1]
+			repo := matches[2]
+			return true, fmt.Sprintf("https://github.com/%s/%s.git", user, repo)
+		}
+	}
+	
+	return false, ""
+}
+
+// extractRepoName extracts the repository name from a GitHub URL
+func extractRepoName(url string) string {
+	// Remove .git suffix
+	url = strings.TrimSuffix(url, ".git")
+	
+	// Extract repo name from URL
+	parts := strings.Split(url, "/")
+	if len(parts) >= 2 {
+		repoName := parts[len(parts)-1]
+		// Sanitize: remove any path traversal attempts and invalid chars
+		repoName = filepath.Base(repoName) // This removes any ../ attempts
+		repoName = strings.ReplaceAll(repoName, "..", "")
+		repoName = strings.ReplaceAll(repoName, "/", "-")
+		repoName = strings.ReplaceAll(repoName, "\\", "-")
+		if repoName == "" || repoName == "." {
+			return "repo"
+		}
+		return repoName
+	}
+	
+	return "repo"
+}
+
+// cloneRepository clones a git repository to the specified path with timeout
+func cloneRepository(url, targetPath string) error {
+	// Check if git is available
+	if _, err := exec.LookPath("git"); err != nil {
+		return fmt.Errorf("git is not installed")
+	}
+	
+	// Create the target directory
+	if err := os.MkdirAll(targetPath, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %v", err)
+	}
+	
+	// Clone the repository with timeout
+	cmd := exec.Command("git", "clone", "--depth", "1", url, targetPath)
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+	
+	// Set a 2-minute timeout for clone operation
+	done := make(chan error, 1)
+	go func() {
+		done <- cmd.Run()
+	}()
+	
+	select {
+	case err := <-done:
+		if err != nil {
+			// If clone failed, remove the directory
+			os.RemoveAll(targetPath)
+			return fmt.Errorf("failed to clone repository: %v", err)
+		}
+		return nil
+	case <-time.After(2 * time.Minute):
+		cmd.Process.Kill()
+		os.RemoveAll(targetPath)
+		return fmt.Errorf("clone operation timed out after 2 minutes")
+	}
+}
+
+// performClone handles the common clone operation logic
+func performClone(cloneURL, basePath string) (string, error) {
+	// Extract repo name and create dated folder name
+	repoName := extractRepoName(cloneURL)
+	datePrefix := time.Now().Format("2006-01-02")
+	dirName := fmt.Sprintf("%s-%s", datePrefix, repoName)
+	fullPath := filepath.Join(basePath, dirName)
+	
+	// Check if directory already exists
+	if _, err := os.Stat(fullPath); err == nil {
+		// Add a number suffix if it exists
+		for i := 2; ; i++ {
+			testPath := fmt.Sprintf("%s-%d", fullPath, i)
+			if _, err := os.Stat(testPath); os.IsNotExist(err) {
+				fullPath = testPath
+				dirName = fmt.Sprintf("%s-%d", dirName, i)
+				break
+			}
+		}
+	}
+	
+	// Clone the repository
+	fmt.Printf("📦 Cloning %s into %s...\n", cloneURL, dirName)
+	if err := cloneRepository(cloneURL, fullPath); err != nil {
+		return "", err
+	}
+	
+	return fullPath, nil
+}
+
 func (m model) Init() tea.Cmd {
 	return tea.EnterAltScreen
 }
@@ -431,18 +563,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 
 		case "ctrl+n":
-			// Quick create new experiment
+			// Quick create new experiment or clone
 			if m.searchTerm != "" {
-				// Use search term as name
-				datePrefix := time.Now().Format("2006-01-02")
-				finalName := fmt.Sprintf("%s-%s", datePrefix, strings.ReplaceAll(m.searchTerm, " ", "-"))
-				fullPath := filepath.Join(m.basePath, finalName)
-				m.selected = &selection{
-					Type: "mkdir",
-					Path: fullPath,
+				// Check if it's a GitHub URL
+				isGH, cloneURL := isGitHubURL(m.searchTerm)
+				if isGH {
+					// Clone repository
+					repoName := extractRepoName(cloneURL)
+					datePrefix := time.Now().Format("2006-01-02")
+					finalName := fmt.Sprintf("%s-%s", datePrefix, repoName)
+					fullPath := filepath.Join(m.basePath, finalName)
+					m.selected = &selection{
+						Type:     "clone",
+						Path:     fullPath,
+						CloneURL: cloneURL,
+					}
+					m.quitting = true
+					return m, tea.Quit
+				} else {
+					// Regular create
+					datePrefix := time.Now().Format("2006-01-02")
+					finalName := fmt.Sprintf("%s-%s", datePrefix, strings.ReplaceAll(m.searchTerm, " ", "-"))
+					fullPath := filepath.Join(m.basePath, finalName)
+					m.selected = &selection{
+						Type: "mkdir",
+						Path: fullPath,
+					}
+					m.quitting = true
+					return m, tea.Quit
 				}
-				m.quitting = true
-				return m, tea.Quit
 			} else {
 				// Enter input mode for new name
 				m.inputMode = true
@@ -467,18 +616,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.quitting = true
 				return m, tea.Quit
 			} else if m.cursor == len(m.filteredTries) {
-				// Create new directory
+				// Create new directory or clone repository
 				if m.searchTerm != "" {
-					// Use search term as name
-					datePrefix := time.Now().Format("2006-01-02")
-					finalName := fmt.Sprintf("%s-%s", datePrefix, strings.ReplaceAll(m.searchTerm, " ", "-"))
-					fullPath := filepath.Join(m.basePath, finalName)
-					m.selected = &selection{
-						Type: "mkdir",
-						Path: fullPath,
+					// Check if it's a GitHub URL
+					isGH, cloneURL := isGitHubURL(m.searchTerm)
+					if isGH {
+						// Clone repository
+						repoName := extractRepoName(cloneURL)
+						datePrefix := time.Now().Format("2006-01-02")
+						finalName := fmt.Sprintf("%s-%s", datePrefix, repoName)
+						fullPath := filepath.Join(m.basePath, finalName)
+						m.selected = &selection{
+							Type:     "clone",
+							Path:     fullPath,
+							CloneURL: cloneURL,
+						}
+						m.quitting = true
+						return m, tea.Quit
+					} else {
+						// Regular create
+						datePrefix := time.Now().Format("2006-01-02")
+						finalName := fmt.Sprintf("%s-%s", datePrefix, strings.ReplaceAll(m.searchTerm, " ", "-"))
+						fullPath := filepath.Join(m.basePath, finalName)
+						m.selected = &selection{
+							Type: "mkdir",
+							Path: fullPath,
+						}
+						m.quitting = true
+						return m, tea.Quit
 					}
-					m.quitting = true
-					return m, tea.Quit
 				} else {
 					// Enter input mode for new name
 					m.inputMode = true
@@ -515,13 +681,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.scrollOffset = 0
 
 		default:
-			// Handle character input for search
-			if len(msg.String()) == 1 {
-				char := msg.String()[0]
-				if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
-					(char >= '0' && char <= '9') || char == '-' || char == '_' ||
-					char == '.' || char == ' ' {
-					m.searchTerm += msg.String()
+			// Handle character input for search (including paste)
+			switch msg.Type {
+			case tea.KeyRunes:
+				// This handles both single chars and pasted content
+				input := string(msg.Runes)
+				if isValidSearchInput(input) {
+					m.searchTerm += input
 					m.filterTries()
 					m.cursor = 0
 					m.scrollOffset = 0
@@ -715,24 +881,39 @@ func (m model) formatEntry(entry tryEntry, isSelected bool) string {
 
 func (m model) formatCreateNew(isSelected bool) string {
 	var result strings.Builder
-
-	result.WriteString("✨ ")
-
 	var displayText string
-	if m.searchTerm == "" {
-		displayText = "Create new experiment..."
-	} else {
-		displayText = fmt.Sprintf("Create: %s", m.searchTerm)
-	}
+	var iconLen int
 
-	if isSelected {
-		result.WriteString(selectedStyle.Render(createNewStyle.Render(displayText)))
+	// Check if search term is a GitHub URL
+	isGH, cloneURL := isGitHubURL(m.searchTerm)
+	
+	if isGH {
+		result.WriteString("📦 ")
+		iconLen = 2
+		repoName := extractRepoName(cloneURL)
+		displayText = fmt.Sprintf("Clone: %s", repoName)
+		if isSelected {
+			result.WriteString(selectedStyle.Render(createNewStyle.Render(displayText)))
+		} else {
+			result.WriteString(createNewStyle.Render(displayText))
+		}
 	} else {
-		result.WriteString(createNewStyle.Render(displayText))
+		result.WriteString("✨ ")
+		iconLen = 2
+		if m.searchTerm == "" {
+			displayText = "Create new experiment..."
+		} else {
+			displayText = fmt.Sprintf("Create: %s", m.searchTerm)
+		}
+		if isSelected {
+			result.WriteString(selectedStyle.Render(createNewStyle.Render(displayText)))
+		} else {
+			result.WriteString(createNewStyle.Render(displayText))
+		}
 	}
 
 	// Padding
-	textLen := len(displayText) + 2        // +2 for "✨ "
+	textLen := len(displayText) + iconLen
 	paddingNeeded := m.width - 2 - textLen // -2 for cursor space
 	if paddingNeeded > 0 {
 		result.WriteString(strings.Repeat(" ", paddingNeeded))
@@ -782,15 +963,74 @@ func (m model) formatRelativeTime(t time.Time) string {
 	}
 }
 
+func handleDirectClone(url string) {
+	// Validate it's a GitHub URL
+	isGH, cloneURL := isGitHubURL(url)
+	if !isGH {
+		fmt.Fprintf(os.Stderr, "Error: Not a valid GitHub URL: %s\n", url)
+		os.Exit(1)
+	}
+	
+	// Get base path
+	basePath := getDefaultPath()
+	if basePath == "" {
+		basePath = promptForPath()
+	}
+	
+	// Perform the clone
+	fullPath, err := performClone(cloneURL, basePath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+	
+	// Change to the directory
+	if err := os.Chdir(fullPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: couldn't change directory: %v\n", err)
+		os.Exit(1)
+	}
+	
+	// Launch a new shell
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+	
+	fmt.Printf("\n✨ Successfully cloned and entering %s\n\n", filepath.Base(fullPath))
+	
+	cmd := exec.Command(shell)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Dir = fullPath
+	
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error launching shell: %v\n", err)
+		os.Exit(1)
+	}
+}
+
 func main() {
 	// Simple argument parsing
 	searchTerm := ""
 	showHelp := false
+	cloneURL := ""
 
-	for _, arg := range os.Args[1:] {
+	args := os.Args[1:]
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
 		switch arg {
 		case "--help", "-h", "help":
 			showHelp = true
+		case "--clone", "-c":
+			// Get the next argument as the URL
+			if i+1 < len(args) {
+				cloneURL = args[i+1]
+				i++ // Skip the URL argument
+			} else {
+				fmt.Fprintln(os.Stderr, "Error: --clone requires a URL argument")
+				os.Exit(1)
+			}
 		default:
 			if !strings.HasPrefix(arg, "-") {
 				searchTerm += arg + " "
@@ -800,6 +1040,12 @@ func main() {
 
 	if showHelp {
 		printHelp()
+		return
+	}
+
+	// Handle direct clone operation
+	if cloneURL != "" {
+		handleDirectClone(cloneURL)
 		return
 	}
 
@@ -900,6 +1146,42 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error launching shell: %v\n", err)
 				os.Exit(1)
 			}
+			
+		case "clone":
+			// Clone GitHub repository
+			cloneURL := m.selected.CloneURL
+			
+			// Perform the clone
+			targetPath, err := performClone(cloneURL, m.basePath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				os.Exit(1)
+			}
+			
+			// Change to the directory
+			if err := os.Chdir(targetPath); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: couldn't change directory: %v\n", err)
+				os.Exit(1)
+			}
+			
+			// Launch a new shell
+			shell := os.Getenv("SHELL")
+			if shell == "" {
+				shell = "/bin/bash"
+			}
+			
+			fmt.Printf("\n✨ Successfully cloned and entering %s\n\n", filepath.Base(targetPath))
+			
+			cmd := exec.Command(shell)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			cmd.Dir = targetPath
+			
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error launching shell: %v\n", err)
+				os.Exit(1)
+			}
 		}
 	}
 }
@@ -915,13 +1197,15 @@ A beautiful TUI for managing lightweight experiment directories.
 Perfect for people with ADHD who need quick, organized workspaces.
 
 USAGE:
-  try [search_term]    Launch selector with optional search
-  try --help          Show this help
+  try [search_term]           Launch selector with optional search
+  try --clone <github-url>    Clone a GitHub repository
+  try --help                  Show this help
 
 FEATURES:
   • Fuzzy search with smart scoring
   • Automatic date prefixing (YYYY-MM-DD)
   • Time-based sorting (recent = higher)
+  • GitHub repository cloning
 
 NAVIGATION:
   ↑/↓          Navigate entries
@@ -938,9 +1222,11 @@ CONFIGURATION:
   Current: %s
 
 EXAMPLES:
-  try                  # Launch selector
-  try neural           # Launch with search for "neural"
-  try new project      # Search for "new project"
+  try                                      # Launch selector
+  try neural                               # Launch with search for "neural"
+  try new project                          # Search for "new project"
+  try github.com/user/repo                 # Shows clone option in TUI
+  try --clone https://github.com/user/repo # Clone directly
 
 First launch automatically creates the base directory.
 Selected directories open in a new shell session.
