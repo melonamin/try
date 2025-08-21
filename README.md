@@ -1,4 +1,6 @@
-<img width="768" height="512" alt="image" src="https://github.com/user-attachments/assets/86036472-c6d3-4774-8c72-2d86bb920a15" />
+<div align="center">
+<img width="384" height="256" alt="image" src="https://github.com/user-attachments/assets/86036472-c6d3-4774-8c72-2d86bb920a15" />
+</div>
 
 # try - fresh directories for every vibe
 
