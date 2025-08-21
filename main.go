@@ -39,6 +39,8 @@ type model struct {
 	quitting      bool
 	inputMode     bool
 	newName       string
+	confirmDelete bool
+	deleteTarget  *tryEntry
 }
 
 type selection struct {
@@ -89,6 +91,13 @@ var (
 	promptStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("86")).
 			Bold(true)
+
+	dangerStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("196")).
+			Bold(true)
+
+	warningStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("214"))
 )
 
 func getConfigPath() string {
@@ -384,11 +393,69 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
+		// Handle delete confirmation mode
+		if m.confirmDelete && m.deleteTarget != nil {
+			switch msg.String() {
+			case "y", "Y":
+				// Perform deletion
+				if err := os.RemoveAll(m.deleteTarget.Path); err != nil {
+					// Could add error handling here, but for now just reset
+					m.confirmDelete = false
+					m.deleteTarget = nil
+					return m, nil
+				}
+				// Reload directories and reset state
+				m.loadTries()
+				m.filterTries()
+				m.confirmDelete = false
+				m.deleteTarget = nil
+				// Adjust cursor if it's out of bounds
+				if m.cursor >= len(m.filteredTries) {
+					m.cursor = len(m.filteredTries) - 1
+					if m.cursor < 0 {
+						m.cursor = 0
+					}
+				}
+			default:
+				// Cancel deletion on any other key
+				m.confirmDelete = false
+				m.deleteTarget = nil
+			}
+			return m, nil
+		}
+
 		// Normal mode
 		switch msg.String() {
 		case "ctrl+c", "esc", "q":
 			m.quitting = true
 			return m, tea.Quit
+
+		case "ctrl+n":
+			// Quick create new experiment
+			if m.searchTerm != "" {
+				// Use search term as name
+				datePrefix := time.Now().Format("2006-01-02")
+				finalName := fmt.Sprintf("%s-%s", datePrefix, strings.ReplaceAll(m.searchTerm, " ", "-"))
+				fullPath := filepath.Join(m.basePath, finalName)
+				m.selected = &selection{
+					Type: "mkdir",
+					Path: fullPath,
+				}
+				m.quitting = true
+				return m, tea.Quit
+			} else {
+				// Enter input mode for new name
+				m.inputMode = true
+				m.newName = ""
+			}
+
+		case "ctrl+d", "delete":
+			// Delete directory with confirmation
+			if m.cursor < len(m.filteredTries) {
+				m.confirmDelete = true
+				entry := m.filteredTries[m.cursor]
+				m.deleteTarget = &entry
+			}
 
 		case "enter":
 			if m.cursor < len(m.filteredTries) {
@@ -419,13 +486,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
-		case "up", "ctrl+p", "k":
+		case "up", "ctrl+p", "ctrl+k":
 			if m.cursor > 0 {
 				m.cursor--
 				m.adjustScroll()
 			}
 
-		case "down", "ctrl+n", "j":
+		case "down", "ctrl+j":
 			totalItems := len(m.filteredTries) + 1
 			if m.cursor < totalItems-1 {
 				m.cursor++
@@ -467,7 +534,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) adjustScroll() {
-	maxVisible := m.height - 8
+	maxVisible := m.height - 10
 	if maxVisible < 3 {
 		maxVisible = 3
 	}
@@ -489,8 +556,22 @@ func (m model) View() string {
 	// Title
 	b.WriteString(titleStyle.Render("📁 Try - Quick Experiment Directories"))
 	b.WriteString("\n")
-	b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
-	b.WriteString("\n")
+
+	// Handle delete confirmation mode
+	if m.confirmDelete && m.deleteTarget != nil {
+		b.WriteString("\n")
+		b.WriteString(dangerStyle.Render("⚠️  Delete Directory"))
+		b.WriteString("\n\n")
+		b.WriteString("Are you sure you want to delete this directory?\n\n")
+		b.WriteString(warningStyle.Render("  " + m.deleteTarget.Name))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("  " + m.deleteTarget.Path))
+		b.WriteString("\n\n")
+		b.WriteString(dangerStyle.Render("This action cannot be undone!"))
+		b.WriteString("\n\n")
+		b.WriteString(helpStyle.Render("Press 'y' to confirm, any other key to cancel"))
+		return b.String()
+	}
 
 	// Handle input mode for new directory
 	if m.inputMode {
@@ -505,6 +586,9 @@ func (m model) View() string {
 		return b.String()
 	}
 
+	b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
+	b.WriteString("\n")
+
 	// Search input
 	b.WriteString(searchStyle.Render("Search: "))
 	b.WriteString(searchInputStyle.Render(m.searchTerm))
@@ -515,8 +599,8 @@ func (m model) View() string {
 	b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
 	b.WriteString("\n")
 
-	// Calculate visible window
-	maxVisible := m.height - 8
+	// Calculate visible window (accounting for extra help lines and separators)
+	maxVisible := m.height - 10
 	if maxVisible < 3 {
 		maxVisible = 3
 	}
@@ -563,10 +647,13 @@ func (m model) View() string {
 		b.WriteString("\n")
 	}
 
-	// Help
 	b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
 	b.WriteString("\n")
-	b.WriteString(helpStyle.Render("↑↓/jk: Navigate  Enter: Select  Ctrl+U: Clear  ESC/q: Quit"))
+	// Navigation hints
+	b.WriteString(helpStyle.Render("↑↓/Ctrl+j,k: Navigate Enter: Select Ctrl+N: Quick new Ctrl+D: Delete"))
+	b.WriteString("\n")
+	// Action hints
+	b.WriteString(helpStyle.Render("ESC/q: Quit"))
 
 	return b.String()
 }
@@ -837,8 +924,11 @@ FEATURES:
   • Time-based sorting (recent = higher)
 
 NAVIGATION:
-  ↑/↓ or j/k   Navigate entries
+  ↑/↓          Navigate entries
+  Ctrl+j/k     Navigate entries (vim-style)
   Enter        Select directory or create new
+  Ctrl+N       Create new experiment (quick)
+  Ctrl+D       Delete selected directory
   Backspace    Delete search character
   Ctrl+U       Clear search
   ESC or q     Cancel and exit
