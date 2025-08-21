@@ -1,3 +1,5 @@
+<img width="768" height="512" alt="image" src="https://github.com/user-attachments/assets/86036472-c6d3-4774-8c72-2d86bb920a15" />
+
 # try - fresh directories for every vibe
 
 > A Go reimplementation of [tobi/try](https://github.com/tobi/try) with GitHub cloning, deletion support, and better performance
