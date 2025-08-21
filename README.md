@@ -2,8 +2,6 @@
 <img width="384" height="256" alt="image" src="https://github.com/user-attachments/assets/86036472-c6d3-4774-8c72-2d86bb920a15" />
 </div>
 
-# try - fresh directories for every vibe
-
 > A Go reimplementation of [tobi/try](https://github.com/tobi/try) with GitHub cloning, deletion support, and better performance
 
 Ever find yourself with 50 directories named `test`, `test2`, `new-test`, `actually-working-test`, scattered across your filesystem? Or worse, just coding in `/tmp` and losing everything?
