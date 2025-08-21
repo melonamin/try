@@ -1,0 +1,874 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"io/fs"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+)
+
+type tryEntry struct {
+	Name     string
+	Basename string
+	Path     string
+	IsNew    bool
+	CTime    time.Time
+	MTime    time.Time
+	Score    float64
+}
+
+type model struct {
+	tries         []tryEntry
+	filteredTries []tryEntry
+	cursor        int
+	scrollOffset  int
+	searchTerm    string
+	selected      *selection
+	basePath      string
+	width         int
+	height        int
+	quitting      bool
+	inputMode     bool
+	newName       string
+}
+
+type selection struct {
+	Type string
+	Path string
+}
+
+var (
+	titleStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("220")).
+			MarginBottom(1)
+
+	searchStyle = lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("86"))
+
+	searchInputStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("255"))
+
+	dimStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240"))
+
+	selectedStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("236")).
+			Bold(true)
+
+	cursorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("220")).
+			Bold(true)
+
+	matchStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("220")).
+			Bold(true)
+
+	dateStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240"))
+
+	separatorStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("237"))
+
+	helpStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("240"))
+
+	createNewStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("82"))
+
+	promptStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("86")).
+			Bold(true)
+)
+
+func getConfigPath() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "try", "config")
+}
+
+func loadStoredPath() string {
+	configPath := getConfigPath()
+	data, err := os.ReadFile(configPath)
+	if err == nil {
+		return strings.TrimSpace(string(data))
+	}
+	return ""
+}
+
+func storePath(path string) error {
+	configPath := getConfigPath()
+	configDir := filepath.Dir(configPath)
+
+	// Create config directory if it doesn't exist
+	if err := os.MkdirAll(configDir, 0755); err != nil {
+		return err
+	}
+
+	return os.WriteFile(configPath, []byte(path), 0644)
+}
+
+func getDefaultPath() string {
+	// First check environment variable
+	if basePath := os.Getenv("TRY_PATH"); basePath != "" {
+		return basePath
+	}
+
+	// Then check stored config
+	if basePath := loadStoredPath(); basePath != "" {
+		return basePath
+	}
+
+	// No default - will need to prompt
+	return ""
+}
+
+func promptForPath() string {
+	home, _ := os.UserHomeDir()
+	defaultPath := filepath.Join(home, "src", "tries")
+
+	fmt.Println(titleStyle.Render("🎉 Welcome to Try!"))
+	fmt.Println()
+	fmt.Println("Try needs a directory to store your experiments.")
+	fmt.Println("This will be created if it doesn't exist.")
+	fmt.Println()
+	fmt.Printf("%s [%s]: ",
+		promptStyle.Render("Where should experiments be stored?"),
+		dimStyle.Render(defaultPath))
+
+	// Read the full line of input (allows spaces in paths)
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nError reading input: %v\n", err)
+		os.Exit(1)
+	}
+	input = strings.TrimSpace(input)
+
+	// Use default if empty
+	if input == "" {
+		input = defaultPath
+	}
+
+	// Expand tilde if present
+	if strings.HasPrefix(input, "~/") {
+		input = filepath.Join(home, input[2:])
+	}
+
+	// Make absolute
+	absPath, err := filepath.Abs(input)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: invalid path: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Store for future use
+	if err := storePath(absPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: couldn't save config: %v\n", err)
+	}
+
+	// Show success message
+	fmt.Println()
+	fmt.Printf("✅ Experiments will be stored in: %s\n", createNewStyle.Render(absPath))
+	fmt.Println(dimStyle.Render("(You can change this by setting TRY_PATH environment variable)"))
+	fmt.Println()
+
+	// Wait for user to acknowledge
+	fmt.Print(helpStyle.Render("Press Enter to continue..."))
+	bufio.NewReader(os.Stdin).ReadString('\n')
+
+	return absPath
+}
+
+func initialModel(searchTerm string) model {
+	basePath := getDefaultPath()
+
+	// If no path configured, prompt for it
+	if basePath == "" {
+		basePath = promptForPath()
+	}
+
+	// Ensure base path exists
+	if err := os.MkdirAll(basePath, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating directory %s: %v\n", basePath, err)
+	}
+
+	m := model{
+		searchTerm: strings.ReplaceAll(searchTerm, " ", "-"),
+		basePath:   basePath,
+		width:      80,
+		height:     24,
+	}
+
+	m.loadTries()
+	m.filterTries()
+	return m
+}
+
+func (m *model) loadTries() {
+	m.tries = []tryEntry{}
+
+	entries, err := os.ReadDir(m.basePath)
+	if err != nil {
+		return
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+
+		path := filepath.Join(m.basePath, entry.Name())
+		stat, _ := os.Stat(path)
+
+		m.tries = append(m.tries, tryEntry{
+			Name:     entry.Name(),
+			Basename: entry.Name(),
+			Path:     path,
+			IsNew:    false,
+			CTime:    info.ModTime(), // Go doesn't have creation time on all platforms
+			MTime:    stat.ModTime(),
+		})
+	}
+}
+
+func (m *model) filterTries() {
+	m.filteredTries = []tryEntry{}
+
+	for _, try := range m.tries {
+		score := m.calculateScore(try)
+		try.Score = score
+
+		if m.searchTerm == "" || score > 0 {
+			m.filteredTries = append(m.filteredTries, try)
+		}
+	}
+
+	// Sort by score descending
+	sort.Slice(m.filteredTries, func(i, j int) bool {
+		return m.filteredTries[i].Score > m.filteredTries[j].Score
+	})
+}
+
+func (m *model) calculateScore(try tryEntry) float64 {
+	score := 0.0
+
+	// Bonus for date-prefixed directories
+	if strings.HasPrefix(try.Basename, "20") && len(try.Basename) > 10 {
+		if try.Basename[4] == '-' && try.Basename[7] == '-' && try.Basename[10] == '-' {
+			score += 2.0
+		}
+	}
+
+	// Search query matching
+	if m.searchTerm != "" {
+		textLower := strings.ToLower(try.Basename)
+		queryLower := strings.ToLower(m.searchTerm)
+		queryChars := []rune(queryLower)
+
+		lastPos := -1
+		queryIdx := 0
+
+		for pos, char := range textLower {
+			if queryIdx >= len(queryChars) {
+				break
+			}
+			if char != queryChars[queryIdx] {
+				continue
+			}
+
+			// Base point + word boundary bonus
+			score += 1.0
+			if pos == 0 || (pos > 0 && !isAlphaNum(rune(textLower[pos-1]))) {
+				score += 1.0
+			}
+
+			// Proximity bonus
+			if lastPos >= 0 {
+				gap := pos - lastPos - 1
+				score += 1.0 / math.Sqrt(float64(gap+1))
+			}
+
+			lastPos = pos
+			queryIdx++
+		}
+
+		// Return 0 if not all query chars matched
+		if queryIdx < len(queryChars) {
+			return 0.0
+		}
+
+		// Density bonus
+		if lastPos >= 0 {
+			score *= float64(len(queryChars)) / float64(lastPos+1)
+		}
+
+		// Length penalty
+		score *= 10.0 / (float64(len(try.Basename)) + 10.0)
+	}
+
+	// Time-based scoring
+	now := time.Now()
+
+	// Creation time bonus
+	daysOld := now.Sub(try.CTime).Hours() / 24
+	score += 2.0 / math.Sqrt(daysOld+1)
+
+	// Access time bonus
+	hoursAccess := now.Sub(try.MTime).Hours()
+	score += 3.0 / math.Sqrt(hoursAccess+1)
+
+	return score
+}
+
+func isAlphaNum(r rune) bool {
+	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+}
+
+func (m model) Init() tea.Cmd {
+	return tea.EnterAltScreen
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+
+	case tea.KeyMsg:
+		// Handle input mode for new directory name
+		if m.inputMode {
+			switch msg.String() {
+			case "ctrl+c", "esc":
+				m.inputMode = false
+				m.newName = ""
+
+			case "enter":
+				if m.newName != "" {
+					datePrefix := time.Now().Format("2006-01-02")
+					finalName := fmt.Sprintf("%s-%s", datePrefix, strings.ReplaceAll(m.newName, " ", "-"))
+					fullPath := filepath.Join(m.basePath, finalName)
+					m.selected = &selection{
+						Type: "mkdir",
+						Path: fullPath,
+					}
+					m.quitting = true
+					return m, tea.Quit
+				}
+
+			case "backspace":
+				if len(m.newName) > 0 {
+					m.newName = m.newName[:len(m.newName)-1]
+				}
+
+			default:
+				// Handle character input
+				if len(msg.String()) == 1 {
+					m.newName += msg.String()
+				}
+			}
+			return m, nil
+		}
+
+		// Normal mode
+		switch msg.String() {
+		case "ctrl+c", "esc", "q":
+			m.quitting = true
+			return m, tea.Quit
+
+		case "enter":
+			if m.cursor < len(m.filteredTries) {
+				// Select existing directory
+				m.selected = &selection{
+					Type: "cd",
+					Path: m.filteredTries[m.cursor].Path,
+				}
+				m.quitting = true
+				return m, tea.Quit
+			} else if m.cursor == len(m.filteredTries) {
+				// Create new directory
+				if m.searchTerm != "" {
+					// Use search term as name
+					datePrefix := time.Now().Format("2006-01-02")
+					finalName := fmt.Sprintf("%s-%s", datePrefix, strings.ReplaceAll(m.searchTerm, " ", "-"))
+					fullPath := filepath.Join(m.basePath, finalName)
+					m.selected = &selection{
+						Type: "mkdir",
+						Path: fullPath,
+					}
+					m.quitting = true
+					return m, tea.Quit
+				} else {
+					// Enter input mode for new name
+					m.inputMode = true
+					m.newName = ""
+				}
+			}
+
+		case "up", "ctrl+p", "k":
+			if m.cursor > 0 {
+				m.cursor--
+				m.adjustScroll()
+			}
+
+		case "down", "ctrl+n", "j":
+			totalItems := len(m.filteredTries) + 1
+			if m.cursor < totalItems-1 {
+				m.cursor++
+				m.adjustScroll()
+			}
+
+		case "backspace":
+			if len(m.searchTerm) > 0 {
+				m.searchTerm = m.searchTerm[:len(m.searchTerm)-1]
+				m.filterTries()
+				m.cursor = 0
+				m.scrollOffset = 0
+			}
+
+		case "ctrl+u":
+			// Clear search
+			m.searchTerm = ""
+			m.filterTries()
+			m.cursor = 0
+			m.scrollOffset = 0
+
+		default:
+			// Handle character input for search
+			if len(msg.String()) == 1 {
+				char := msg.String()[0]
+				if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+					(char >= '0' && char <= '9') || char == '-' || char == '_' ||
+					char == '.' || char == ' ' {
+					m.searchTerm += msg.String()
+					m.filterTries()
+					m.cursor = 0
+					m.scrollOffset = 0
+				}
+			}
+		}
+	}
+
+	return m, nil
+}
+
+func (m *model) adjustScroll() {
+	maxVisible := m.height - 8
+	if maxVisible < 3 {
+		maxVisible = 3
+	}
+
+	if m.cursor < m.scrollOffset {
+		m.scrollOffset = m.cursor
+	} else if m.cursor >= m.scrollOffset+maxVisible {
+		m.scrollOffset = m.cursor - maxVisible + 1
+	}
+}
+
+func (m model) View() string {
+	if m.quitting {
+		return ""
+	}
+
+	var b strings.Builder
+
+	// Title
+	b.WriteString(titleStyle.Render("📁 Try - Quick Experiment Directories"))
+	b.WriteString("\n")
+	b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
+	b.WriteString("\n")
+
+	// Handle input mode for new directory
+	if m.inputMode {
+		b.WriteString("\n")
+		b.WriteString(promptStyle.Render("New directory name:"))
+		b.WriteString("\n")
+		datePrefix := time.Now().Format("2006-01-02")
+		b.WriteString(dimStyle.Render(datePrefix + "-"))
+		b.WriteString(searchInputStyle.Render(m.newName))
+		b.WriteString("\n\n")
+		b.WriteString(helpStyle.Render("Enter: Create  ESC: Cancel"))
+		return b.String()
+	}
+
+	// Search input
+	b.WriteString(searchStyle.Render("Search: "))
+	b.WriteString(searchInputStyle.Render(m.searchTerm))
+	if m.searchTerm == "" {
+		b.WriteString(dimStyle.Render(" (type to filter)"))
+	}
+	b.WriteString("\n")
+	b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
+	b.WriteString("\n")
+
+	// Calculate visible window
+	maxVisible := m.height - 8
+	if maxVisible < 3 {
+		maxVisible = 3
+	}
+	totalItems := len(m.filteredTries) + 1
+
+	// Display items
+	visibleEnd := m.scrollOffset + maxVisible
+	if visibleEnd > totalItems {
+		visibleEnd = totalItems
+	}
+
+	for idx := m.scrollOffset; idx < visibleEnd; idx++ {
+		// Add blank line before "Create new"
+		if idx == len(m.filteredTries) && len(m.filteredTries) > 0 {
+			b.WriteString("\n")
+		}
+
+		// Cursor
+		isSelected := idx == m.cursor
+		if isSelected {
+			b.WriteString(cursorStyle.Render("→ "))
+		} else {
+			b.WriteString("  ")
+		}
+
+		// Display entry
+		if idx < len(m.filteredTries) {
+			entry := m.filteredTries[idx]
+			line := m.formatEntry(entry, isSelected)
+			b.WriteString(line)
+		} else {
+			// Create new option
+			line := m.formatCreateNew(isSelected)
+			b.WriteString(line)
+		}
+		b.WriteString("\n")
+	}
+
+	// Scroll indicator
+	if totalItems > maxVisible {
+		b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf("[%d-%d/%d]", m.scrollOffset+1, visibleEnd, totalItems)))
+		b.WriteString("\n")
+	}
+
+	// Help
+	b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
+	b.WriteString("\n")
+	b.WriteString(helpStyle.Render("↑↓/jk: Navigate  Enter: Select  Ctrl+U: Clear  ESC/q: Quit"))
+
+	return b.String()
+}
+
+func (m model) formatEntry(entry tryEntry, isSelected bool) string {
+	var result strings.Builder
+
+	// Icon
+	result.WriteString("📁 ")
+
+	// Parse and format the name
+	name := entry.Basename
+	var displayName string
+
+	if parts := strings.SplitN(name, "-", 4); len(parts) >= 4 &&
+		len(parts[0]) == 4 && len(parts[1]) == 2 && len(parts[2]) == 2 {
+		// Date-prefixed format
+		datePart := strings.Join(parts[:3], "-")
+		namePart := strings.Join(parts[3:], "-")
+
+		if isSelected {
+			displayName = selectedStyle.Render(
+				dateStyle.Render(datePart) +
+					dimStyle.Render("-") +
+					m.highlightMatches(namePart))
+		} else {
+			displayName = dateStyle.Render(datePart) +
+				dimStyle.Render("-") +
+				m.highlightMatches(namePart)
+		}
+	} else {
+		// Regular name
+		if isSelected {
+			displayName = selectedStyle.Render(m.highlightMatches(name))
+		} else {
+			displayName = m.highlightMatches(name)
+		}
+	}
+
+	result.WriteString(displayName)
+
+	// Add metadata (time and score)
+	timeText := m.formatRelativeTime(entry.MTime)
+	scoreText := fmt.Sprintf("%.1f", entry.Score)
+	metaText := fmt.Sprintf(" %s, score: %s", timeText, scoreText)
+
+	// Calculate padding
+	plainTextLen := len(entry.Basename) + 2 // +2 for emoji
+	metaLen := len(metaText)
+	paddingNeeded := m.width - 2 - plainTextLen - metaLen // -2 for cursor space
+	if paddingNeeded > 0 {
+		result.WriteString(strings.Repeat(" ", paddingNeeded))
+	}
+
+	result.WriteString(dimStyle.Render(metaText))
+
+	return result.String()
+}
+
+func (m model) formatCreateNew(isSelected bool) string {
+	var result strings.Builder
+
+	result.WriteString("✨ ")
+
+	var displayText string
+	if m.searchTerm == "" {
+		displayText = "Create new experiment..."
+	} else {
+		displayText = fmt.Sprintf("Create: %s", m.searchTerm)
+	}
+
+	if isSelected {
+		result.WriteString(selectedStyle.Render(createNewStyle.Render(displayText)))
+	} else {
+		result.WriteString(createNewStyle.Render(displayText))
+	}
+
+	// Padding
+	textLen := len(displayText) + 2        // +2 for "✨ "
+	paddingNeeded := m.width - 2 - textLen // -2 for cursor space
+	if paddingNeeded > 0 {
+		result.WriteString(strings.Repeat(" ", paddingNeeded))
+	}
+
+	return result.String()
+}
+
+func (m model) highlightMatches(text string) string {
+	if m.searchTerm == "" {
+		return text
+	}
+
+	var result strings.Builder
+	queryLower := strings.ToLower(m.searchTerm)
+	queryChars := []rune(queryLower)
+	queryIdx := 0
+
+	for _, char := range text {
+		if queryIdx < len(queryChars) && strings.ToLower(string(char)) == string(queryChars[queryIdx]) {
+			result.WriteString(matchStyle.Render(string(char)))
+			queryIdx++
+		} else {
+			result.WriteString(string(char))
+		}
+	}
+
+	return result.String()
+}
+
+func (m model) formatRelativeTime(t time.Time) string {
+	duration := time.Since(t)
+
+	switch {
+	case duration < 10*time.Second:
+		return "just now"
+	case duration < time.Hour:
+		return fmt.Sprintf("%dm ago", int(duration.Minutes()))
+	case duration < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(duration.Hours()))
+	case duration < 30*24*time.Hour:
+		return fmt.Sprintf("%dd ago", int(duration.Hours()/24))
+	case duration < 365*24*time.Hour:
+		return fmt.Sprintf("%dmo ago", int(duration.Hours()/(24*30)))
+	default:
+		return fmt.Sprintf("%dy ago", int(duration.Hours()/(24*365)))
+	}
+}
+
+func main() {
+	// Simple argument parsing
+	searchTerm := ""
+	showHelp := false
+
+	for _, arg := range os.Args[1:] {
+		switch arg {
+		case "--help", "-h", "help":
+			showHelp = true
+		default:
+			if !strings.HasPrefix(arg, "-") {
+				searchTerm += arg + " "
+			}
+		}
+	}
+
+	if showHelp {
+		printHelp()
+		return
+	}
+
+	searchTerm = strings.TrimSpace(searchTerm)
+
+	// Check if we have a TTY
+	if !isatty(os.Stdin.Fd()) || !isatty(os.Stdout.Fd()) {
+		fmt.Fprintln(os.Stderr, "Error: try requires an interactive terminal")
+		os.Exit(1)
+	}
+
+	// Run the TUI
+	m := initialModel(searchTerm)
+	p := tea.NewProgram(m, tea.WithAltScreen())
+
+	finalModel, err := p.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	var ok bool
+	m, ok = finalModel.(model)
+	if !ok {
+		fmt.Fprintf(os.Stderr, "Error: unexpected model type returned\n")
+		os.Exit(1)
+	}
+
+	// Handle the selection
+	if m.selected != nil {
+		switch m.selected.Type {
+		case "cd":
+			// Touch the directory to update access time
+			if err := os.Chtimes(m.selected.Path, time.Now(), time.Now()); err != nil {
+				// Non-fatal, just log it
+				fmt.Fprintf(os.Stderr, "Warning: couldn't update access time: %v\n", err)
+			}
+
+			// Change to the directory
+			if err := os.Chdir(m.selected.Path); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: couldn't change directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Launch a new shell in the selected directory
+			shell := os.Getenv("SHELL")
+			if shell == "" {
+				shell = "/bin/bash"
+			}
+
+			fmt.Printf("\n🚀 Entering %s\n\n", filepath.Base(m.selected.Path))
+
+			cmd := exec.Command(shell)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			cmd.Dir = m.selected.Path
+
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error launching shell: %v\n", err)
+				os.Exit(1)
+			}
+
+		case "mkdir":
+			// Create the new directory
+			if err := os.MkdirAll(m.selected.Path, 0755); err != nil {
+				fmt.Fprintf(os.Stderr, "Error creating directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Touch it
+			if err := os.Chtimes(m.selected.Path, time.Now(), time.Now()); err != nil {
+				// Non-fatal, just log it
+				fmt.Fprintf(os.Stderr, "Warning: couldn't update access time: %v\n", err)
+			}
+
+			// Change to it
+			if err := os.Chdir(m.selected.Path); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: couldn't change directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Launch a new shell
+			shell := os.Getenv("SHELL")
+			if shell == "" {
+				shell = "/bin/bash"
+			}
+
+			fmt.Printf("\n✨ Created and entering %s\n\n", filepath.Base(m.selected.Path))
+
+			cmd := exec.Command(shell)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			cmd.Dir = m.selected.Path
+
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error launching shell: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
+}
+
+func printHelp() {
+	basePath := getDefaultPath()
+	if basePath == "" {
+		basePath = "Not configured (will prompt on first use)"
+	}
+	help := fmt.Sprintf(`📁 try - Quick Experiment Directories
+
+A beautiful TUI for managing lightweight experiment directories.
+Perfect for people with ADHD who need quick, organized workspaces.
+
+USAGE:
+  try [search_term]    Launch selector with optional search
+  try --help          Show this help
+
+FEATURES:
+  • Fuzzy search with smart scoring
+  • Automatic date prefixing (YYYY-MM-DD)
+  • Time-based sorting (recent = higher)
+
+NAVIGATION:
+  ↑/↓ or j/k   Navigate entries
+  Enter        Select directory or create new
+  Backspace    Delete search character
+  Ctrl+U       Clear search
+  ESC or q     Cancel and exit
+
+CONFIGURATION:
+  Set TRY_PATH environment variable to change base directory
+  Current: %s
+
+EXAMPLES:
+  try                  # Launch selector
+  try neural           # Launch with search for "neural"
+  try new project      # Search for "new project"
+
+First launch automatically creates the base directory.
+Selected directories open in a new shell session.
+`, basePath)
+
+	fmt.Print(help)
+}
+
+func isatty(fd uintptr) bool {
+	// Simple check for TTY
+	var stat fs.FileInfo
+	file := os.NewFile(fd, "")
+	if file == nil {
+		return false
+	}
+	stat, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return stat.Mode()&os.ModeCharDevice != 0
+}
