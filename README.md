@@ -2,8 +2,6 @@
 
 > A Go reimplementation of [tobi/try](https://github.com/tobi/try) with GitHub cloning, deletion support, and better performance
 
-This is a fork of the original Ruby-based [try](https://github.com/tobi/try) tool, rewritten in Go with additional features for modern development workflows.
-
 Ever find yourself with 50 directories named `test`, `test2`, `new-test`, `actually-working-test`, scattered across your filesystem? Or worse, just coding in `/tmp` and losing everything?
 
 **try** is here for your beautifully chaotic mind.
