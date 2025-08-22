@@ -18,6 +18,32 @@ Instantly navigate through all your experiment directories with:
 
 ## Installation
 
+### Download Pre-built Binaries
+
+Download the latest release from [GitHub Releases](https://github.com/melonamin/try/releases):
+
+#### macOS (Universal)
+```bash
+curl -L https://github.com/melonamin/try/releases/latest/download/try-macos-universal.zip -o try.zip
+unzip try.zip
+chmod +x try-macos-universal
+sudo mv try-macos-universal /usr/local/bin/try
+```
+
+#### Linux (amd64)
+```bash
+curl -L https://github.com/melonamin/try/releases/latest/download/try-linux-amd64.tar.gz | tar xz
+chmod +x try-linux-amd64
+sudo mv try-linux-amd64 /usr/local/bin/try
+```
+
+#### Linux (arm64)
+```bash
+curl -L https://github.com/melonamin/try/releases/latest/download/try-linux-arm64.tar.gz | tar xz
+chmod +x try-linux-arm64
+sudo mv try-linux-arm64 /usr/local/bin/try
+```
+
 ### Using Go
 ```bash
 go install github.com/melonamin/try@latest
