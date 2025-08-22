@@ -18,6 +18,13 @@ Instantly navigate through all your experiment directories with:
 
 ## Installation
 
+### Homebrew (macOS)
+
+```bash
+brew tap melonamin/formulae
+brew install try
+```
+
 ### Download Pre-built Binaries
 
 Download the latest release from [GitHub Releases](https://github.com/melonamin/try/releases):
