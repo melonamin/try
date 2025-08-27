@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -991,10 +992,7 @@ func handleDirectClone(url string) {
 	}
 	
 	// Launch a new shell
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/bash"
-	}
+	shell := getShell()
 	
 	fmt.Printf("\n✨ Successfully cloned and entering %s\n\n", filepath.Base(fullPath))
 	
@@ -1091,10 +1089,7 @@ func main() {
 			}
 
 			// Launch a new shell in the selected directory
-			shell := os.Getenv("SHELL")
-			if shell == "" {
-				shell = "/bin/bash"
-			}
+			shell := getShell()
 
 			fmt.Printf("\n🚀 Entering %s\n\n", filepath.Base(m.selected.Path))
 
@@ -1129,10 +1124,7 @@ func main() {
 			}
 
 			// Launch a new shell
-			shell := os.Getenv("SHELL")
-			if shell == "" {
-				shell = "/bin/bash"
-			}
+			shell := getShell()
 
 			fmt.Printf("\n✨ Created and entering %s\n\n", filepath.Base(m.selected.Path))
 
@@ -1165,10 +1157,7 @@ func main() {
 			}
 			
 			// Launch a new shell
-			shell := os.Getenv("SHELL")
-			if shell == "" {
-				shell = "/bin/bash"
-			}
+			shell := getShell()
 			
 			fmt.Printf("\n✨ Successfully cloned and entering %s\n\n", filepath.Base(targetPath))
 			
@@ -1247,4 +1236,168 @@ func isatty(fd uintptr) bool {
 		return false
 	}
 	return stat.Mode()&os.ModeCharDevice != 0
+}
+
+// detectShellFromEnv detects shell from environment variables
+func detectShellFromEnv() string {
+	// Check for shell-specific environment variables
+	if os.Getenv("FISH_VERSION") != "" {
+		// Fish shell, try to find the fish binary
+		if fishPath, err := exec.LookPath("fish"); err == nil {
+			return fishPath
+		}
+	}
+	
+	if os.Getenv("ZSH_VERSION") != "" {
+		// Zsh shell
+		if zshPath, err := exec.LookPath("zsh"); err == nil {
+			return zshPath
+		}
+	}
+	
+	if os.Getenv("BASH_VERSION") != "" {
+		// Bash shell
+		if bashPath, err := exec.LookPath("bash"); err == nil {
+			return bashPath
+		}
+	}
+	
+	return ""
+}
+
+// getExecutableFromPID gets the executable path for a given PID
+func getExecutableFromPID(pid int) (string, error) {
+	// Try Linux /proc approach first
+	procPath := fmt.Sprintf("/proc/%d/exe", pid)
+	if execPath, err := os.Readlink(procPath); err == nil {
+		return execPath, nil
+	}
+	
+	// Try macOS ps approach
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "command=")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	
+	// Parse the first word from ps output
+	command := strings.TrimSpace(string(output))
+	if command == "" {
+		return "", fmt.Errorf("no command found")
+	}
+	
+	// Extract just the executable path (first word)
+	parts := strings.Fields(command)
+	if len(parts) == 0 {
+		return "", fmt.Errorf("no command parts")
+	}
+	
+	execPath := parts[0]
+	
+	// Handle login shells that start with '-' (like -zsh, -fish, -bash)
+	if strings.HasPrefix(execPath, "-") {
+		// Remove the leading dash and find the actual executable
+		shellName := execPath[1:]
+		if actualPath, err := exec.LookPath(shellName); err == nil {
+			return actualPath, nil
+		}
+		// If LookPath fails, return the name without the dash
+		return shellName, nil
+	}
+	
+	return execPath, nil
+}
+
+// getParentPID gets the parent PID for a given PID
+func getParentPID(pid int) (int, error) {
+	// Try Linux /proc approach first
+	statPath := fmt.Sprintf("/proc/%d/stat", pid)
+	data, err := os.ReadFile(statPath)
+	if err == nil {
+		// /proc/PID/stat has PPID as the 4th field
+		fields := strings.Fields(string(data))
+		if len(fields) > 3 {
+			return strconv.Atoi(fields[3])
+		}
+	}
+	
+	// Try macOS ps approach
+	cmd := exec.Command("ps", "-p", strconv.Itoa(pid), "-o", "ppid=")
+	output, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	
+	ppidStr := strings.TrimSpace(string(output))
+	return strconv.Atoi(ppidStr)
+}
+
+// isKnownShell checks if the given path is a known shell
+func isKnownShell(execPath string) bool {
+	knownShells := []string{
+		"bash", "zsh", "fish", "sh", "dash", "ksh", "csh", "tcsh", "ash",
+	}
+	
+	baseName := filepath.Base(execPath)
+	for _, shell := range knownShells {
+		if baseName == shell {
+			return true
+		}
+	}
+	
+	return false
+}
+
+// detectShellFromProcess attempts to detect shell by walking the process tree
+func detectShellFromProcess() string {
+	// Start with current process's parent
+	pid := os.Getppid()
+	
+	// Walk up the process tree (max 5 levels to avoid infinite loops)
+	for i := 0; i < 5 && pid > 1; i++ {
+		execPath, err := getExecutableFromPID(pid)
+		if err != nil {
+			break
+		}
+		
+		if isKnownShell(execPath) {
+			return execPath
+		}
+		
+		// Get parent of this process
+		parentPID, err := getParentPID(pid)
+		if err != nil {
+			break
+		}
+		pid = parentPID
+	}
+	
+	return ""
+}
+
+// detectShell attempts to detect the currently running shell
+func detectShell() string {
+	// First try environment variable detection (fastest)
+	if shell := detectShellFromEnv(); shell != "" {
+		return shell
+	}
+	
+	// Then try process tree inspection (more reliable)
+	return detectShellFromProcess()
+}
+
+// getShell returns the shell to use, with detection fallback
+func getShell() string {
+	// First try to detect the current shell
+	if detected := detectShell(); detected != "" {
+		return detected
+	}
+	
+	// Fall back to SHELL environment variable
+	if shell := os.Getenv("SHELL"); shell != "" {
+		return shell
+	}
+	
+	// Final fallback
+	return "/bin/bash"
 }
