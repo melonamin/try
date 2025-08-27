@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"math"
@@ -15,7 +16,21 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/muesli/termenv"
 )
+
+// Configuration constants
+const (
+	defaultShell     = "/bin/bash"
+	defaultTriesDir  = "src/tries"
+	configFileName   = "config"
+	configDirName    = ".config/try"
+)
+
+type Config struct {
+	Path  string `json:"path"`
+	Shell string `json:"shell,omitempty"`
+}
 
 type tryEntry struct {
 	Name     string
@@ -103,29 +118,65 @@ var (
 )
 
 func getConfigPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "try", "config")
+	// Use os.UserConfigDir() for platform-appropriate config location:
+	// - Linux: ~/.config
+	// - macOS: ~/Library/Application Support
+	// - Windows: %AppData%
+	configHome, err := os.UserConfigDir()
+	if err != nil {
+		// Fallback to the legacy method if os.UserConfigDir() fails
+		home, _ := os.UserHomeDir()
+		return filepath.Join(home, configDirName, configFileName)
+	}
+	
+	// Use "try" as the app-specific directory name
+	return filepath.Join(configHome, "try", configFileName)
 }
 
-func loadStoredPath() string {
+func loadConfig() (*Config, error) {
 	configPath := getConfigPath()
 	data, err := os.ReadFile(configPath)
-	if err == nil {
-		return strings.TrimSpace(string(data))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &Config{}, nil
+		}
+		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
-	return ""
+	
+	// Try to parse as JSON first
+	var config Config
+	if err := json.Unmarshal(data, &config); err != nil {
+		// Might be old format (plain text path)
+		path := strings.TrimSpace(string(data))
+		if path != "" {
+			fmt.Fprintf(os.Stderr, "Note: Migrating config from old format to new JSON format\n")
+			return &Config{Path: path}, nil
+		}
+		return &Config{}, nil
+	}
+	
+	return &config, nil
 }
 
-func storePath(path string) error {
+func saveConfig(config *Config) error {
 	configPath := getConfigPath()
 	configDir := filepath.Dir(configPath)
 
 	// Create config directory if it doesn't exist
 	if err := os.MkdirAll(configDir, 0755); err != nil {
-		return err
+		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
-	return os.WriteFile(configPath, []byte(path), 0644)
+	data, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	if err := os.WriteFile(configPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config file: %w", err)
+	}
+
+	return nil
 }
 
 func getDefaultPath() string {
@@ -135,17 +186,36 @@ func getDefaultPath() string {
 	}
 
 	// Then check stored config
-	if basePath := loadStoredPath(); basePath != "" {
-		return basePath
+	config, err := loadConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+	}
+	if config != nil && config.Path != "" {
+		return config.Path
 	}
 
 	// No default - will need to prompt
 	return ""
 }
 
+func getShell(config *Config) string {
+	// First check config override
+	if config != nil && config.Shell != "" {
+		return config.Shell
+	}
+	
+	// Fall back to SHELL environment variable
+	if shell := os.Getenv("SHELL"); shell != "" {
+		return shell
+	}
+	
+	// Final fallback
+	return defaultShell
+}
+
 func promptForPath() string {
 	home, _ := os.UserHomeDir()
-	defaultPath := filepath.Join(home, "src", "tries")
+	defaultPath := filepath.Join(home, defaultTriesDir)
 
 	fmt.Println(titleStyle.Render("🎉 Welcome to Try!"))
 	fmt.Println()
@@ -182,15 +252,47 @@ func promptForPath() string {
 		os.Exit(1)
 	}
 
-	// Store for future use
-	if err := storePath(absPath); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: couldn't save config: %v\n", err)
+	config := &Config{Path: absPath}
+
+	// Now prompt for shell configuration
+	fmt.Println()
+	fmt.Println(promptStyle.Render("Shell Configuration (optional)"))
+	currentShell := os.Getenv("SHELL")
+	if currentShell == "" {
+		currentShell = defaultShell
+	}
+	fmt.Printf("Current SHELL: %s\n", dimStyle.Render(currentShell))
+	fmt.Print("Override shell (press Enter to use $SHELL): ")
+	
+	shellInput, err := reader.ReadString('\n')
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\nError reading input: %v\n", err)
+		// Don't exit, just use default
+	} else {
+		shellInput = strings.TrimSpace(shellInput)
+		if shellInput != "" {
+			// Validate the shell exists
+			if _, err := exec.LookPath(shellInput); err == nil {
+				config.Shell = shellInput
+				fmt.Printf("✅ Shell set to: %s\n", createNewStyle.Render(shellInput))
+			} else {
+				fmt.Printf("⚠️  Shell '%s' not found, using $SHELL\n", shellInput)
+			}
+		}
+	}
+
+	// Store config
+	if err := saveConfig(config); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
 	}
 
 	// Show success message
 	fmt.Println()
 	fmt.Printf("✅ Experiments will be stored in: %s\n", createNewStyle.Render(absPath))
-	fmt.Println(dimStyle.Render("(You can change this by setting TRY_PATH environment variable)"))
+	if config.Shell != "" {
+		fmt.Printf("✅ Shell override: %s\n", createNewStyle.Render(config.Shell))
+	}
+	fmt.Printf("%s\n", dimStyle.Render(fmt.Sprintf("(You can change these settings by editing %s)", getConfigPath())))
 	fmt.Println()
 
 	// Wait for user to acknowledge
@@ -991,10 +1093,8 @@ func handleDirectClone(url string) {
 	}
 	
 	// Launch a new shell
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/bash"
-	}
+	config, _ := loadConfig()
+	shell := getShell(config)
 	
 	fmt.Printf("\n✨ Successfully cloned and entering %s\n\n", filepath.Base(fullPath))
 	
@@ -1015,6 +1115,7 @@ func main() {
 	searchTerm := ""
 	showHelp := false
 	cloneURL := ""
+	selectOnly := false
 
 	args := os.Args[1:]
 	for i := 0; i < len(args); i++ {
@@ -1022,6 +1123,8 @@ func main() {
 		switch arg {
 		case "--help", "-h", "help":
 			showHelp = true
+		case "--select-only", "-s":
+			selectOnly = true
 		case "--clone", "-c":
 			// Get the next argument as the URL
 			if i+1 < len(args) {
@@ -1052,14 +1155,22 @@ func main() {
 	searchTerm = strings.TrimSpace(searchTerm)
 
 	// Check if we have a TTY
-	if !isatty(os.Stdin.Fd()) || !isatty(os.Stdout.Fd()) {
+	if !checkTTYRequirements(selectOnly) {
 		fmt.Fprintln(os.Stderr, "Error: try requires an interactive terminal")
 		os.Exit(1)
 	}
 
 	// Run the TUI
 	m := initialModel(searchTerm)
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	var p *tea.Program
+	if selectOnly {
+		// Output TUI to stderr so stdout can be piped
+		// Force colors by setting the color profile globally
+		lipgloss.SetColorProfile(termenv.ANSI256)
+		p = tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(os.Stderr))
+	} else {
+		p = tea.NewProgram(m, tea.WithAltScreen())
+	}
 
 	finalModel, err := p.Run()
 	if err != nil {
@@ -1081,7 +1192,15 @@ func main() {
 			// Touch the directory to update access time
 			if err := os.Chtimes(m.selected.Path, time.Now(), time.Now()); err != nil {
 				// Non-fatal, just log it
-				fmt.Fprintf(os.Stderr, "Warning: couldn't update access time: %v\n", err)
+				if !selectOnly {
+					fmt.Fprintf(os.Stderr, "Warning: couldn't update access time: %v\n", err)
+				}
+			}
+
+			if selectOnly {
+				// Just output the path and exit
+				fmt.Println(m.selected.Path)
+				os.Exit(0)
 			}
 
 			// Change to the directory
@@ -1091,10 +1210,8 @@ func main() {
 			}
 
 			// Launch a new shell in the selected directory
-			shell := os.Getenv("SHELL")
-			if shell == "" {
-				shell = "/bin/bash"
-			}
+			config, _ := loadConfig()
+			shell := getShell(config)
 
 			fmt.Printf("\n🚀 Entering %s\n\n", filepath.Base(m.selected.Path))
 
@@ -1119,7 +1236,15 @@ func main() {
 			// Touch it
 			if err := os.Chtimes(m.selected.Path, time.Now(), time.Now()); err != nil {
 				// Non-fatal, just log it
-				fmt.Fprintf(os.Stderr, "Warning: couldn't update access time: %v\n", err)
+				if !selectOnly {
+					fmt.Fprintf(os.Stderr, "Warning: couldn't update access time: %v\n", err)
+				}
+			}
+
+			if selectOnly {
+				// Just output the path and exit
+				fmt.Println(m.selected.Path)
+				os.Exit(0)
 			}
 
 			// Change to it
@@ -1129,10 +1254,8 @@ func main() {
 			}
 
 			// Launch a new shell
-			shell := os.Getenv("SHELL")
-			if shell == "" {
-				shell = "/bin/bash"
-			}
+			config, _ := loadConfig()
+			shell := getShell(config)
 
 			fmt.Printf("\n✨ Created and entering %s\n\n", filepath.Base(m.selected.Path))
 
@@ -1158,6 +1281,12 @@ func main() {
 				os.Exit(1)
 			}
 			
+			if selectOnly {
+				// Just output the path and exit
+				fmt.Println(targetPath)
+				os.Exit(0)
+			}
+			
 			// Change to the directory
 			if err := os.Chdir(targetPath); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: couldn't change directory: %v\n", err)
@@ -1165,10 +1294,8 @@ func main() {
 			}
 			
 			// Launch a new shell
-			shell := os.Getenv("SHELL")
-			if shell == "" {
-				shell = "/bin/bash"
-			}
+			config, _ := loadConfig()
+			shell := getShell(config)
 			
 			fmt.Printf("\n✨ Successfully cloned and entering %s\n\n", filepath.Base(targetPath))
 			
@@ -1191,6 +1318,11 @@ func printHelp() {
 	if basePath == "" {
 		basePath = "Not configured (will prompt on first use)"
 	}
+	config, _ := loadConfig()
+	shellInfo := ""
+	if config.Shell != "" {
+		shellInfo = fmt.Sprintf("\n  Shell:    %s", config.Shell)
+	}
 	help := fmt.Sprintf(`📁 try - Quick Experiment Directories
 
 A beautiful TUI for managing lightweight experiment directories.
@@ -1198,6 +1330,7 @@ Perfect for people with ADHD who need quick, organized workspaces.
 
 USAGE:
   try [search_term]           Launch selector with optional search
+  try --select-only, -s       Output selected path instead of launching shell
   try --clone <github-url>    Clone a GitHub repository
   try --help                  Show this help
 
@@ -1219,7 +1352,7 @@ NAVIGATION:
 
 CONFIGURATION:
   Set TRY_PATH environment variable to change base directory
-  Current: %s
+  Current: %s%s
 
 EXAMPLES:
   try                                      # Launch selector
@@ -1227,10 +1360,12 @@ EXAMPLES:
   try new project                          # Search for "new project"
   try github.com/user/repo                 # Shows clone option in TUI
   try --clone https://github.com/user/repo # Clone directly
+  try -s                                   # Select and output path
+  cd $(try -s)                             # Use with cd in current shell
 
 First launch automatically creates the base directory.
 Selected directories open in a new shell session.
-`, basePath)
+`, basePath, shellInfo)
 
 	fmt.Print(help)
 }
@@ -1247,4 +1382,14 @@ func isatty(fd uintptr) bool {
 		return false
 	}
 	return stat.Mode()&os.ModeCharDevice != 0
+}
+
+// checkTTYRequirements validates TTY requirements based on mode
+func checkTTYRequirements(selectOnly bool) bool {
+	if selectOnly {
+		// For select-only mode, we only need stdin and stderr to be TTY (stdout goes to pipe)
+		return isatty(os.Stdin.Fd()) && isatty(os.Stderr.Fd())
+	}
+	// Normal mode requires stdin and stdout to be TTY
+	return isatty(os.Stdin.Fd()) && isatty(os.Stdout.Fd())
 }
