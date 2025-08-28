@@ -132,6 +132,8 @@ try redis                                # Jump to redis experiment or create ne
 try new api                              # Start with "2025-01-21-new-api"
 try github.com/user/repo                 # Shows clone option in TUI
 try --clone https://github.com/user/repo # Clone directly without TUI
+try --select-only                        # Output selected path (for shell integration)
+try -s redis                             # Search and output path without launching shell
 try --help                               # See all options
 ```
 
@@ -148,6 +150,8 @@ try --help                               # See all options
 
 ## Configuration
 
+### Environment Variables
+
 Set `TRY_PATH` to change where experiments are stored:
 
 ```bash
@@ -155,6 +159,20 @@ export TRY_PATH=~/code/sketches
 ```
 
 Default: `~/src/tries`
+
+### Configuration File
+
+On first run, `try` creates a configuration file at `~/.config/try/config` where you can set:
+- **Path**: Base directory for experiments
+- **Shell**: Override which shell to use (instead of `$SHELL`)
+
+Example config:
+```json
+{
+  "path": "/home/user/experiments",
+  "shell": "fish"  // Optional: force a specific shell
+}
+```
 
 ## Comparison with Original
 
@@ -168,8 +186,81 @@ Default: `~/src/tries`
 | **Performance** | Good | Excellent |
 | **Binary Size** | ~20KB + Ruby | ~4-5MB standalone |
 | **Cross-platform** | Ruby dependent | Native binaries |
-| **Shell Integration** | ✅ Via eval | ❌ Spawns subshell |
+| **Shell Integration** | ✅ Via eval | ✅ Both modes |
 | **Dependencies** | Ruby runtime | None |
+
+## Shell Integration
+
+### Why Subprocess by Default?
+
+`try` launches a new shell subprocess by default for several reasons:
+
+1. **Clean Environment** - Each experiment gets a fresh shell environment without inheriting temporary variables or functions
+2. **Easy Exit** - Simply `exit` to return to your original directory and environment
+3. **Project Isolation** - Different experiments can have different environment setups without conflicts
+4. **Safety** - Can't accidentally modify your parent shell's state
+5. **Cross-Shell Compatibility** - Works identically across bash, zsh, fish, etc.
+
+### Select-Only Mode (cd in current shell)
+
+If you prefer to `cd` in your current shell instead of launching a subprocess, use the `--select-only` (`-s`) flag with shell functions:
+
+#### Bash/Zsh
+
+Add to your `.bashrc` or `.zshrc`:
+
+```bash
+# Function to cd to selected try directory
+trycd() {
+    local dir
+    dir=$(try --select-only "$@")
+    if [[ -n "$dir" ]]; then
+        cd "$dir"
+        echo "Changed to: $(basename "$dir")"
+    fi
+}
+alias tc=trycd  # Short alias
+
+# Or simpler one-liner
+alias trycd='cd $(try -s)'
+```
+
+#### Fish
+
+Add to your `~/.config/fish/config.fish`:
+
+```fish
+# Function to cd to selected try directory
+function trycd
+    set -l dir (try --select-only $argv)
+    if test -n "$dir"
+        cd $dir
+        echo "Changed to: "(basename $dir)
+    end
+end
+alias tc=trycd  # Short alias
+```
+
+#### Usage Examples
+
+```bash
+# Using shell functions
+trycd                    # Browse and cd to selection
+trycd redis              # Search for 'redis' and cd
+tc neural                # Short alias
+
+# Direct usage
+cd $(try -s)             # Browse and cd
+cd $(try -s tensorflow)  # Search and cd
+```
+
+### How it Works
+
+In select-only mode:
+- The TUI interface appears on stderr (so you can see it)
+- The selected path is output to stdout (so it can be captured)
+- Colors are preserved using ANSI256 profile
+- Works with command substitution: `$(try -s)`
 
 ## Acknowledgements
 
@@ -194,6 +285,9 @@ A: Because you have 200 directories and can't remember if you called it `test-re
 
 **Q: Why not use `fzf`?**
 A: fzf is great for files. This is specifically for project directories, with time-awareness and auto-creation built in.
+
+**Q: Why does it launch a new shell instead of just cd?**
+A: Launching a subprocess provides a clean, isolated environment for each experiment. You can always use `--select-only` mode with shell functions if you prefer cd behavior.
 
 **Q: Can I use this for real projects?**
 A: You can, but it's designed for experiments. Real projects deserve real names in real locations.
