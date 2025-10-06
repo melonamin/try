@@ -150,15 +150,18 @@ try --help                               # See all options
 
 ## Configuration
 
+`try` supports both environment variables and a configuration file. Environment variables always override config file settings.
+
 ### Environment Variables
 
-Set `TRY_PATH` to change where experiments are stored:
-
 ```bash
-export TRY_PATH=~/code/sketches
+export TRY_PATH=~/code/sketches    # Override base directory
+export TRY_SHELL=/bin/fish         # Override shell (instead of $SHELL)
 ```
 
-Default: `~/src/tries`
+Defaults:
+- Path: `~/src/tries`
+- Shell: `$SHELL` or `/bin/bash`
 
 ### Configuration File
 
@@ -170,9 +173,20 @@ Example config:
 ```json
 {
   "path": "/home/user/experiments",
-  "shell": "fish"  // Optional: force a specific shell
+  "shell": "fish"
 }
 ```
+
+**Note**: The config file uses `~/.config/try` on all platforms (Linux, macOS, Windows) for consistency and to avoid macOS Application Support restrictions with symlinks.
+
+### Configuration Priority
+
+Settings are resolved in this order (highest priority first):
+1. `TRY_PATH` and `TRY_SHELL` environment variables
+2. Config file (`~/.config/try/config`)
+3. Default values
+
+This means you can have a config file for default settings and temporarily override them with environment variables.
 
 ## Comparison with Original
 

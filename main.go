@@ -21,6 +21,7 @@ import (
 
 // Configuration constants
 const (
+	version          = "0.2.1"
 	defaultShell     = "/bin/bash"
 	defaultTriesDir  = "src/tries"
 	configFileName   = "config"
@@ -30,6 +31,81 @@ const (
 type Config struct {
 	Path  string `json:"path"`
 	Shell string `json:"shell,omitempty"`
+}
+
+// sanitizePath validates and cleans a path to prevent path traversal attacks
+func sanitizePath(path string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+
+	// Clean the path to resolve . and .. elements
+	cleaned := filepath.Clean(path)
+
+	// Expand ~ to home directory
+	if strings.HasPrefix(cleaned, "~") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("cannot expand ~: %w", err)
+		}
+		if cleaned == "~" {
+			cleaned = home
+		} else if strings.HasPrefix(cleaned, "~/") {
+			cleaned = filepath.Join(home, cleaned[2:])
+		}
+	}
+
+	// Make absolute if relative
+	if !filepath.IsAbs(cleaned) {
+		abs, err := filepath.Abs(cleaned)
+		if err != nil {
+			return "", fmt.Errorf("cannot resolve path: %w", err)
+		}
+		cleaned = abs
+	}
+
+	// Final clean to normalize
+	cleaned = filepath.Clean(cleaned)
+
+	return cleaned, nil
+}
+
+// validateShell checks if a shell executable exists and is valid
+func validateShell(shell string) error {
+	if shell == "" {
+		return nil
+	}
+
+	// Check if shell is an absolute path
+	if !filepath.IsAbs(shell) {
+		return fmt.Errorf("shell must be an absolute path: %s", shell)
+	}
+
+	// Check if shell exists and is executable
+	if _, err := exec.LookPath(shell); err != nil {
+		return fmt.Errorf("shell not found or not executable: %s", shell)
+	}
+
+	return nil
+}
+
+// validateConfig validates and sanitizes config values
+func (c *Config) Validate() error {
+	if c.Path != "" {
+		sanitized, err := sanitizePath(c.Path)
+		if err != nil {
+			return fmt.Errorf("invalid path: %w", err)
+		}
+		c.Path = sanitized
+	}
+
+	if c.Shell != "" {
+		if err := validateShell(c.Shell); err != nil {
+			return fmt.Errorf("invalid shell: %w", err)
+		}
+	}
+
+	return nil
 }
 
 type tryEntry struct {
@@ -50,6 +126,7 @@ type model struct {
 	searchTerm    string
 	selected      *selection
 	basePath      string
+	config        *Config
 	width         int
 	height        int
 	quitting      bool
@@ -118,31 +195,112 @@ var (
 )
 
 func getConfigPath() string {
-	// Use os.UserConfigDir() for platform-appropriate config location:
-	// - Linux: ~/.config
-	// - macOS: ~/Library/Application Support
-	// - Windows: %AppData%
-	configHome, err := os.UserConfigDir()
+	// Always use ~/.config/try for consistency across platforms
+	// This avoids macOS Application Support restrictions and symlink issues
+	home, err := os.UserHomeDir()
 	if err != nil {
-		// Fallback to the legacy method if os.UserConfigDir() fails
-		home, _ := os.UserHomeDir()
-		return filepath.Join(home, configDirName, configFileName)
+		// If we can't find home, return empty string
+		// This will cause config operations to fail gracefully
+		return ""
 	}
-	
-	// Use "try" as the app-specific directory name
-	return filepath.Join(configHome, "try", configFileName)
+	return filepath.Join(home, ".config", "try", configFileName)
+}
+
+// getLegacyConfigPaths returns old config locations for migration
+func getLegacyConfigPaths() []string {
+	_, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+
+	newPath := getConfigPath()
+	pathMap := make(map[string]bool)
+
+	// macOS Application Support path from early v0.2.0
+	configHome, err := os.UserConfigDir()
+	if err == nil {
+		appSupportPath := filepath.Join(configHome, "try", configFileName)
+		if appSupportPath != newPath {
+			pathMap[appSupportPath] = true
+		}
+	}
+
+	// Convert map to slice (deduplicated)
+	var paths []string
+	for path := range pathMap {
+		paths = append(paths, path)
+	}
+
+	return paths
+}
+
+// tryMigration attempts to migrate config from legacy locations
+func tryMigration(configPath string) (*Config, bool, error) {
+	for _, legacyPath := range getLegacyConfigPaths() {
+		legacyData, legacyErr := os.ReadFile(legacyPath)
+		if legacyErr != nil {
+			continue
+		}
+
+		fmt.Fprintf(os.Stderr, "Note: Migrating config from %s to %s\n", legacyPath, configPath)
+
+		// Parse legacy config
+		var config Config
+		if err := json.Unmarshal(legacyData, &config); err != nil {
+			// Might be old plain text format
+			path := strings.TrimSpace(string(legacyData))
+			if path != "" {
+				fmt.Fprintf(os.Stderr, "Note: Converting from plain text to JSON format\n")
+				config = Config{Path: path}
+			}
+		}
+
+		// Save to new location
+		if err := saveConfig(&config); err != nil {
+			return nil, false, fmt.Errorf("failed to save migrated config: %w", err)
+		}
+
+		// Successfully migrated, create backup and remove old config
+		backupPath := legacyPath + ".bak"
+		if err := os.Rename(legacyPath, backupPath); err != nil {
+			// If rename fails, just try to remove
+			os.Remove(legacyPath)
+		} else {
+			fmt.Fprintf(os.Stderr, "Note: Legacy config backed up to %s\n", backupPath)
+		}
+
+		return &config, true, nil
+	}
+
+	return nil, false, nil
 }
 
 func loadConfig() (*Config, error) {
 	configPath := getConfigPath()
+	if configPath == "" {
+		// Cannot determine config path, use empty config
+		fmt.Fprintf(os.Stderr, "Warning: cannot determine home directory, using ephemeral config\n")
+		return &Config{}, nil
+	}
 	data, err := os.ReadFile(configPath)
+
 	if err != nil {
 		if os.IsNotExist(err) {
+			// Try legacy locations for migration
+			config, migrated, migErr := tryMigration(configPath)
+			if migErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed during config migration check: %v\n", migErr)
+			}
+			if migrated {
+				return config, nil
+			}
+
+			// No config found anywhere
 			return &Config{}, nil
 		}
 		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
-	
+
 	// Try to parse as JSON first
 	var config Config
 	if err := json.Unmarshal(data, &config); err != nil {
@@ -154,16 +312,19 @@ func loadConfig() (*Config, error) {
 		}
 		return &Config{}, nil
 	}
-	
+
 	return &config, nil
 }
 
 func saveConfig(config *Config) error {
 	configPath := getConfigPath()
+	if configPath == "" {
+		return fmt.Errorf("cannot save config: home directory not found")
+	}
 	configDir := filepath.Dir(configPath)
 
-	// Create config directory if it doesn't exist
-	if err := os.MkdirAll(configDir, 0755); err != nil {
+	// Create config directory if it doesn't exist with restrictive permissions
+	if err := os.MkdirAll(configDir, 0700); err != nil {
 		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
@@ -172,24 +333,39 @@ func saveConfig(config *Config) error {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 
-	if err := os.WriteFile(configPath, data, 0644); err != nil {
+	if err := os.WriteFile(configPath, data, 0600); err != nil {
 		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
 	return nil
 }
 
-func getDefaultPath() string {
-	// First check environment variable
-	if basePath := os.Getenv("TRY_PATH"); basePath != "" {
-		return basePath
-	}
-
-	// Then check stored config
+// getResolvedConfig loads config and applies environment variable overrides
+func getResolvedConfig() (*Config, error) {
+	// Always load config first
 	config, err := loadConfig()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+		return nil, err
 	}
+
+	// Apply environment variable overrides
+	if tryPath := os.Getenv("TRY_PATH"); tryPath != "" {
+		config.Path = tryPath
+	}
+
+	if tryShell := os.Getenv("TRY_SHELL"); tryShell != "" {
+		config.Shell = tryShell
+	}
+
+	// Validate and sanitize the final config
+	if err := config.Validate(); err != nil {
+		return nil, err
+	}
+
+	return config, nil
+}
+
+func getDefaultPath(config *Config) string {
 	if config != nil && config.Path != "" {
 		return config.Path
 	}
@@ -199,16 +375,16 @@ func getDefaultPath() string {
 }
 
 func getShell(config *Config) string {
-	// First check config override
+	// Config has already been resolved with environment variable overrides
 	if config != nil && config.Shell != "" {
 		return config.Shell
 	}
-	
+
 	// Fall back to SHELL environment variable
 	if shell := os.Getenv("SHELL"); shell != "" {
 		return shell
 	}
-	
+
 	// Final fallback
 	return defaultShell
 }
@@ -240,13 +416,8 @@ func promptForPath() string {
 		input = defaultPath
 	}
 
-	// Expand tilde if present
-	if strings.HasPrefix(input, "~/") {
-		input = filepath.Join(home, input[2:])
-	}
-
-	// Make absolute
-	absPath, err := filepath.Abs(input)
+	// Sanitize the path
+	absPath, err := sanitizePath(input)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: invalid path: %v\n", err)
 		os.Exit(1)
@@ -271,12 +442,23 @@ func promptForPath() string {
 	} else {
 		shellInput = strings.TrimSpace(shellInput)
 		if shellInput != "" {
-			// Validate the shell exists
-			if _, err := exec.LookPath(shellInput); err == nil {
-				config.Shell = shellInput
-				fmt.Printf("✅ Shell set to: %s\n", createNewStyle.Render(shellInput))
-			} else {
+			// Find the shell executable
+			shellPath, err := exec.LookPath(shellInput)
+			if err != nil {
 				fmt.Printf("⚠️  Shell '%s' not found, using $SHELL\n", shellInput)
+			} else {
+				// Make absolute if it's not already
+				if !filepath.IsAbs(shellPath) {
+					shellPath, err = filepath.Abs(shellPath)
+					if err != nil {
+						fmt.Printf("⚠️  Cannot resolve shell path: %v\n", err)
+						shellPath = ""
+					}
+				}
+				if shellPath != "" {
+					config.Shell = shellPath
+					fmt.Printf("✅ Shell set to: %s\n", createNewStyle.Render(shellPath))
+				}
 			}
 		}
 	}
@@ -302,12 +484,19 @@ func promptForPath() string {
 	return absPath
 }
 
-func initialModel(searchTerm string) model {
-	basePath := getDefaultPath()
+func initialModel(searchTerm string, config *Config) model {
+	basePath := getDefaultPath(config)
 
 	// If no path configured, prompt for it
 	if basePath == "" {
 		basePath = promptForPath()
+		// Reload config after prompting
+		var err error
+		config, err = getResolvedConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to reload config after setting path: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Ensure base path exists
@@ -318,6 +507,7 @@ func initialModel(searchTerm string) model {
 	m := model{
 		searchTerm: strings.ReplaceAll(searchTerm, " ", "-"),
 		basePath:   basePath,
+		config:     config,
 		width:      80,
 		height:     24,
 	}
@@ -1065,45 +1255,51 @@ func (m model) formatRelativeTime(t time.Time) string {
 	}
 }
 
-func handleDirectClone(url string) {
+func handleDirectClone(url string, config *Config) {
 	// Validate it's a GitHub URL
 	isGH, cloneURL := isGitHubURL(url)
 	if !isGH {
 		fmt.Fprintf(os.Stderr, "Error: Not a valid GitHub URL: %s\n", url)
 		os.Exit(1)
 	}
-	
+
 	// Get base path
-	basePath := getDefaultPath()
+	basePath := getDefaultPath(config)
 	if basePath == "" {
 		basePath = promptForPath()
+		// Reload config after prompting
+		var err error
+		config, err = getResolvedConfig()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: failed to reload config after setting path: %v\n", err)
+			os.Exit(1)
+		}
 	}
-	
+
 	// Perform the clone
 	fullPath, err := performClone(cloneURL, basePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	// Change to the directory
 	if err := os.Chdir(fullPath); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: couldn't change directory: %v\n", err)
 		os.Exit(1)
 	}
-	
+
 	// Launch a new shell
-	config, _ := loadConfig()
 	shell := getShell(config)
-	
+
 	fmt.Printf("\n✨ Successfully cloned and entering %s\n\n", filepath.Base(fullPath))
-	
+
 	cmd := exec.Command(shell)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	cmd.Dir = fullPath
-	
+
 	if err := cmd.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error launching shell: %v\n", err)
 		os.Exit(1)
@@ -1114,6 +1310,7 @@ func main() {
 	// Simple argument parsing
 	searchTerm := ""
 	showHelp := false
+	showVersion := false
 	cloneURL := ""
 	selectOnly := false
 
@@ -1123,6 +1320,8 @@ func main() {
 		switch arg {
 		case "--help", "-h", "help":
 			showHelp = true
+		case "--version", "-v":
+			showVersion = true
 		case "--select-only", "-s":
 			selectOnly = true
 		case "--clone", "-c":
@@ -1141,14 +1340,27 @@ func main() {
 		}
 	}
 
+	// Handle version flag early (doesn't need config)
+	if showVersion {
+		fmt.Printf("try version %s\n", version)
+		return
+	}
+
+	// Load config once at startup
+	config, err := getResolvedConfig()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading config: %v\n", err)
+		os.Exit(1)
+	}
+
 	if showHelp {
-		printHelp()
+		printHelp(config)
 		return
 	}
 
 	// Handle direct clone operation
 	if cloneURL != "" {
-		handleDirectClone(cloneURL)
+		handleDirectClone(cloneURL, config)
 		return
 	}
 
@@ -1161,7 +1373,7 @@ func main() {
 	}
 
 	// Run the TUI
-	m := initialModel(searchTerm)
+	m := initialModel(searchTerm, config)
 	var p *tea.Program
 	if selectOnly {
 		// Output TUI to stderr so stdout can be piped
@@ -1210,8 +1422,7 @@ func main() {
 			}
 
 			// Launch a new shell in the selected directory
-			config, _ := loadConfig()
-			shell := getShell(config)
+			shell := getShell(m.config)
 
 			fmt.Printf("\n🚀 Entering %s\n\n", filepath.Base(m.selected.Path))
 
@@ -1254,8 +1465,7 @@ func main() {
 			}
 
 			// Launch a new shell
-			config, _ := loadConfig()
-			shell := getShell(config)
+			shell := getShell(m.config)
 
 			fmt.Printf("\n✨ Created and entering %s\n\n", filepath.Base(m.selected.Path))
 
@@ -1273,29 +1483,28 @@ func main() {
 		case "clone":
 			// Clone GitHub repository
 			cloneURL := m.selected.CloneURL
-			
+
 			// Perform the clone
 			targetPath, err := performClone(cloneURL, m.basePath)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 				os.Exit(1)
 			}
-			
+
 			if selectOnly {
 				// Just output the path and exit
 				fmt.Println(targetPath)
 				os.Exit(0)
 			}
-			
+
 			// Change to the directory
 			if err := os.Chdir(targetPath); err != nil {
 				fmt.Fprintf(os.Stderr, "Error: couldn't change directory: %v\n", err)
 				os.Exit(1)
 			}
-			
+
 			// Launch a new shell
-			config, _ := loadConfig()
-			shell := getShell(config)
+			shell := getShell(m.config)
 			
 			fmt.Printf("\n✨ Successfully cloned and entering %s\n\n", filepath.Base(targetPath))
 			
@@ -1313,16 +1522,16 @@ func main() {
 	}
 }
 
-func printHelp() {
-	basePath := getDefaultPath()
+func printHelp(config *Config) {
+	basePath := getDefaultPath(config)
 	if basePath == "" {
 		basePath = "Not configured (will prompt on first use)"
 	}
-	config, _ := loadConfig()
 	shellInfo := ""
-	if config.Shell != "" {
-		shellInfo = fmt.Sprintf("\n  Shell:    %s", config.Shell)
+	if config != nil && config.Shell != "" {
+		shellInfo = fmt.Sprintf("\n  Shell override: %s", config.Shell)
 	}
+	configPath := getConfigPath()
 	help := fmt.Sprintf(`📁 try - Quick Experiment Directories
 
 A beautiful TUI for managing lightweight experiment directories.
@@ -1332,6 +1541,7 @@ USAGE:
   try [search_term]           Launch selector with optional search
   try --select-only, -s       Output selected path instead of launching shell
   try --clone <github-url>    Clone a GitHub repository
+  try --version, -v           Show version information
   try --help                  Show this help
 
 FEATURES:
@@ -1351,8 +1561,12 @@ NAVIGATION:
   ESC or q     Cancel and exit
 
 CONFIGURATION:
-  Set TRY_PATH environment variable to change base directory
-  Current: %s%s
+  Environment variables (override config file):
+    TRY_PATH   - Base directory for experiments
+    TRY_SHELL  - Shell to use (overrides $SHELL)
+
+  Config file: %s
+  Current path: %s%s
 
 EXAMPLES:
   try                                      # Launch selector
@@ -1365,7 +1579,7 @@ EXAMPLES:
 
 First launch automatically creates the base directory.
 Selected directories open in a new shell session.
-`, basePath, shellInfo)
+`, configPath, basePath, shellInfo)
 
 	fmt.Print(help)
 }
