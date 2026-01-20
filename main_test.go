@@ -1,0 +1,567 @@
+package main
+
+import (
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+)
+
+// ============================================================================
+// Text Editing Helper Tests
+// ============================================================================
+
+func TestInsertCharAt(t *testing.T) {
+	tests := []struct {
+		name     string
+		text     string
+		pos      int
+		char     rune
+		wantText string
+		wantPos  int
+	}{
+		{"insert at start", "hello", 0, 'X', "Xhello", 1},
+		{"insert at end", "hello", 5, 'X', "helloX", 6},
+		{"insert in middle", "hello", 2, 'X', "heXllo", 3},
+		{"insert into empty", "", 0, 'X', "X", 1},
+		{"insert unicode", "hello", 2, '世', "he世llo", 3},
+		{"negative pos clamps to 0", "hello", -5, 'X', "Xhello", 1},
+		{"pos beyond length clamps", "hello", 100, 'X', "helloX", 6},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotText, gotPos := insertCharAt(tt.text, tt.pos, tt.char)
+			if gotText != tt.wantText {
+				t.Errorf("insertCharAt() text = %q, want %q", gotText, tt.wantText)
+			}
+			if gotPos != tt.wantPos {
+				t.Errorf("insertCharAt() pos = %d, want %d", gotPos, tt.wantPos)
+			}
+		})
+	}
+}
+
+func TestInsertStringAt(t *testing.T) {
+	tests := []struct {
+		name     string
+		text     string
+		pos      int
+		insert   string
+		wantText string
+		wantPos  int
+	}{
+		{"insert at start", "world", 0, "hello ", "hello world", 6},
+		{"insert at end", "hello", 5, " world", "hello world", 11},
+		{"insert in middle", "helo", 2, "l", "hello", 3},
+		{"insert empty string", "hello", 2, "", "hello", 2},
+		{"insert into empty", "", 0, "hello", "hello", 5},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotText, gotPos := insertStringAt(tt.text, tt.pos, tt.insert)
+			if gotText != tt.wantText {
+				t.Errorf("insertStringAt() text = %q, want %q", gotText, tt.wantText)
+			}
+			if gotPos != tt.wantPos {
+				t.Errorf("insertStringAt() pos = %d, want %d", gotPos, tt.wantPos)
+			}
+		})
+	}
+}
+
+func TestDeleteCharBackward(t *testing.T) {
+	tests := []struct {
+		name     string
+		text     string
+		pos      int
+		wantText string
+		wantPos  int
+	}{
+		{"delete from middle", "hello", 3, "helo", 2},
+		{"delete from end", "hello", 5, "hell", 4},
+		{"delete at start (no-op)", "hello", 0, "hello", 0},
+		{"delete single char", "X", 1, "", 0},
+		{"delete unicode", "he世llo", 3, "hello", 2},
+		{"negative pos (no-op)", "hello", -1, "hello", -1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotText, gotPos := deleteCharBackward(tt.text, tt.pos)
+			if gotText != tt.wantText {
+				t.Errorf("deleteCharBackward() text = %q, want %q", gotText, tt.wantText)
+			}
+			if gotPos != tt.wantPos {
+				t.Errorf("deleteCharBackward() pos = %d, want %d", gotPos, tt.wantPos)
+			}
+		})
+	}
+}
+
+func TestDeleteToEnd(t *testing.T) {
+	tests := []struct {
+		name     string
+		text     string
+		pos      int
+		wantText string
+	}{
+		{"delete from middle", "hello world", 5, "hello"},
+		{"delete from start", "hello", 0, ""},
+		{"delete at end (no-op)", "hello", 5, "hello"},
+		{"delete beyond end (no-op)", "hello", 100, "hello"},
+		{"negative pos clamps", "hello", -1, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := deleteToEnd(tt.text, tt.pos)
+			if got != tt.wantText {
+				t.Errorf("deleteToEnd() = %q, want %q", got, tt.wantText)
+			}
+		})
+	}
+}
+
+func TestDeleteWordBackward(t *testing.T) {
+	tests := []struct {
+		name     string
+		text     string
+		pos      int
+		wantText string
+		wantPos  int
+	}{
+		{"delete word from end", "hello world", 11, "hello ", 6},
+		{"delete word with trailing spaces", "hello  ", 7, "", 0},
+		{"delete from middle of word", "hello world", 8, "hello rld", 6},
+		{"delete at start (no-op)", "hello", 0, "hello", 0},
+		{"delete single word", "hello", 5, "", 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotText, gotPos := deleteWordBackward(tt.text, tt.pos)
+			if gotText != tt.wantText {
+				t.Errorf("deleteWordBackward() text = %q, want %q", gotText, tt.wantText)
+			}
+			if gotPos != tt.wantPos {
+				t.Errorf("deleteWordBackward() pos = %d, want %d", gotPos, tt.wantPos)
+			}
+		})
+	}
+}
+
+func TestRuneLen(t *testing.T) {
+	tests := []struct {
+		name string
+		text string
+		want int
+	}{
+		{"empty", "", 0},
+		{"ascii", "hello", 5},
+		{"unicode", "hello世界", 7},
+		{"emoji", "hello👋", 6},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := runeLen(tt.text); got != tt.want {
+				t.Errorf("runeLen() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// GitHub URL Parsing Tests
+// ============================================================================
+
+func TestIsGitHubURL(t *testing.T) {
+	tests := []struct {
+		name      string
+		input     string
+		wantIsGH  bool
+		wantURL   string
+	}{
+		{"https url", "https://github.com/user/repo", true, "https://github.com/user/repo.git"},
+		{"https url with .git", "https://github.com/user/repo.git", true, "https://github.com/user/repo.git"},
+		{"http url", "http://github.com/user/repo", true, "https://github.com/user/repo.git"},
+		{"github.com without protocol", "github.com/user/repo", true, "https://github.com/user/repo.git"},
+		{"git@ ssh url", "git@github.com:user/repo.git", true, "https://github.com/user/repo.git"},
+		{"gh: shorthand", "gh:user/repo", true, "https://github.com/user/repo.git"},
+		{"trailing slash", "https://github.com/user/repo/", true, "https://github.com/user/repo.git"},
+		{"not github", "https://gitlab.com/user/repo", false, ""},
+		{"random text", "hello world", false, ""},
+		{"empty", "", false, ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotIsGH, gotURL := isGitHubURL(tt.input)
+			if gotIsGH != tt.wantIsGH {
+				t.Errorf("isGitHubURL() isGH = %v, want %v", gotIsGH, tt.wantIsGH)
+			}
+			if gotURL != tt.wantURL {
+				t.Errorf("isGitHubURL() url = %q, want %q", gotURL, tt.wantURL)
+			}
+		})
+	}
+}
+
+func TestExtractRepoName(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{"https url", "https://github.com/user/my-repo.git", "my-repo"},
+		{"without .git", "https://github.com/user/my-repo", "my-repo"},
+		{"complex name", "https://github.com/user/my.complex-repo_name.git", "my.complex-repo_name"},
+		{"short url", "repo.git", "repo"},
+		{"just name", "repo", "repo"},
+		{"empty returns default", "", "repo"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := extractRepoName(tt.url); got != tt.want {
+				t.Errorf("extractRepoName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// Path and Branch Sanitization Tests
+// ============================================================================
+
+func TestSanitizeBranchName(t *testing.T) {
+	tests := []struct {
+		name   string
+		branch string
+		want   string
+	}{
+		{"simple", "main", "main"},
+		{"with slash", "feature/my-feature", "feature-my-feature"},
+		{"multiple slashes", "user/feature/sub", "user-feature-sub"},
+		{"with backslash", "feature\\test", "feature-test"},
+		{"double dots", "feature..test", "feature-test"},
+		{"already clean", "my-feature-branch", "my-feature-branch"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := sanitizeBranchName(tt.branch); got != tt.want {
+				t.Errorf("sanitizeBranchName() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestSanitizePath(t *testing.T) {
+	home, _ := os.UserHomeDir()
+
+	tests := []struct {
+		name    string
+		path    string
+		want    string
+		wantErr bool
+	}{
+		{"empty path", "", "", false},
+		{"absolute path", "/tmp/test", "/tmp/test", false},
+		{"tilde expansion", "~/test", filepath.Join(home, "test"), false},
+		{"just tilde", "~", home, false},
+		{"relative path", "test/dir", "", false}, // Will be made absolute, can't predict
+		{"clean dots", "/tmp/../tmp/test", "/tmp/test", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := sanitizePath(tt.path)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("sanitizePath() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if tt.want != "" && got != tt.want {
+				t.Errorf("sanitizePath() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// Git Repository Detection Tests
+// ============================================================================
+
+func TestIsGitRepository(t *testing.T) {
+	// Create a temp directory structure for testing
+	tempDir := t.TempDir()
+
+	// Create a fake git repo
+	gitRepoDir := filepath.Join(tempDir, "git-repo")
+	os.MkdirAll(filepath.Join(gitRepoDir, ".git"), 0755)
+
+	// Create a nested directory inside the git repo
+	nestedDir := filepath.Join(gitRepoDir, "nested", "deep")
+	os.MkdirAll(nestedDir, 0755)
+
+	// Create a non-git directory
+	nonGitDir := filepath.Join(tempDir, "non-git")
+	os.MkdirAll(nonGitDir, 0755)
+
+	tests := []struct {
+		name     string
+		path     string
+		wantRepo string
+		wantIs   bool
+	}{
+		{"git repo root", gitRepoDir, gitRepoDir, true},
+		{"nested in git repo", nestedDir, gitRepoDir, true},
+		{"non-git directory", nonGitDir, "", false},
+		{"non-existent", filepath.Join(tempDir, "nonexistent"), "", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gotRepo, gotIs := isGitRepository(tt.path)
+			if gotIs != tt.wantIs {
+				t.Errorf("isGitRepository() isRepo = %v, want %v", gotIs, tt.wantIs)
+			}
+			if tt.wantIs && gotRepo != tt.wantRepo {
+				t.Errorf("isGitRepository() repo = %q, want %q", gotRepo, tt.wantRepo)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// Search Input Validation Tests
+// ============================================================================
+
+func TestIsValidSearchInput(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{"letters", "hello", true},
+		{"numbers", "123", true},
+		{"mixed", "hello123", true},
+		{"with dash", "hello-world", true},
+		{"with underscore", "hello_world", true},
+		{"with dot", "hello.world", true},
+		{"with space", "hello world", true},
+		{"with colon", "user:repo", true},
+		{"with slash", "user/repo", true},
+		{"with at", "user@host", true},
+		{"empty", "", false},
+		{"special chars", "hello!", false},
+		{"newline", "hello\nworld", false},
+		{"tab", "hello\tworld", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isValidSearchInput(tt.input); got != tt.want {
+				t.Errorf("isValidSearchInput(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// ============================================================================
+// Fuzzy Matching/Scoring Tests
+// ============================================================================
+
+func TestCalculateScore(t *testing.T) {
+	// Create a model with empty search term first
+	m := model{searchTerm: ""}
+
+	// Test entries
+	now := time.Now()
+	recentEntry := tryEntry{
+		Basename: "2024-01-15-project-alpha",
+		CTime:    now.Add(-24 * time.Hour), // 1 day old
+		MTime:    now.Add(-1 * time.Hour),  // accessed 1 hour ago
+	}
+	oldEntry := tryEntry{
+		Basename: "2024-01-01-old-project",
+		CTime:    now.Add(-30 * 24 * time.Hour), // 30 days old
+		MTime:    now.Add(-7 * 24 * time.Hour),  // accessed 7 days ago
+	}
+
+	t.Run("empty query uses time-based scoring", func(t *testing.T) {
+		recentScore := m.calculateScore(recentEntry)
+		oldScore := m.calculateScore(oldEntry)
+
+		if recentScore <= oldScore {
+			t.Errorf("recent entry should score higher: recent=%f, old=%f", recentScore, oldScore)
+		}
+	})
+
+	t.Run("query filters non-matching", func(t *testing.T) {
+		m.searchTerm = "xyz"
+		score := m.calculateScore(recentEntry)
+		if score != 0 {
+			t.Errorf("non-matching entry should score 0, got %f", score)
+		}
+	})
+
+	t.Run("query matches substring", func(t *testing.T) {
+		m.searchTerm = "proj"
+		score := m.calculateScore(recentEntry)
+		if score == 0 {
+			t.Error("matching entry should score > 0")
+		}
+	})
+
+	t.Run("case insensitive matching", func(t *testing.T) {
+		m.searchTerm = "PROJ"
+		score := m.calculateScore(recentEntry)
+		if score == 0 {
+			t.Error("case-insensitive matching should work")
+		}
+	})
+
+	t.Run("date-prefixed entries get bonus", func(t *testing.T) {
+		m.searchTerm = ""
+		dated := tryEntry{Basename: "2024-01-15-project", CTime: now, MTime: now}
+		undated := tryEntry{Basename: "project", CTime: now, MTime: now}
+
+		datedScore := m.calculateScore(dated)
+		undatedScore := m.calculateScore(undated)
+
+		if datedScore <= undatedScore {
+			t.Errorf("dated entry should score higher: dated=%f, undated=%f", datedScore, undatedScore)
+		}
+	})
+
+	t.Run("consecutive chars bonus", func(t *testing.T) {
+		m.searchTerm = "proj"
+		consecutive := tryEntry{Basename: "project", CTime: now, MTime: now}
+		spread := tryEntry{Basename: "p-r-o-j-e-c-t", CTime: now, MTime: now}
+
+		consScore := m.calculateScore(consecutive)
+		spreadScore := m.calculateScore(spread)
+
+		if consScore <= spreadScore {
+			t.Errorf("consecutive should score higher: consecutive=%f, spread=%f", consScore, spreadScore)
+		}
+	})
+
+	t.Run("shorter strings preferred", func(t *testing.T) {
+		m.searchTerm = "proj"
+		short := tryEntry{Basename: "project", CTime: now, MTime: now}
+		long := tryEntry{Basename: "project-with-long-suffix", CTime: now, MTime: now}
+
+		shortScore := m.calculateScore(short)
+		longScore := m.calculateScore(long)
+
+		if shortScore <= longScore {
+			t.Errorf("shorter should score higher: short=%f, long=%f", shortScore, longScore)
+		}
+	})
+}
+
+// ============================================================================
+// Shell Detection Tests
+// ============================================================================
+
+func TestDetectUserShell(t *testing.T) {
+	// Save original env
+	origTryShell := os.Getenv("TRY_SHELL")
+	origShell := os.Getenv("SHELL")
+	defer func() {
+		os.Setenv("TRY_SHELL", origTryShell)
+		os.Setenv("SHELL", origShell)
+	}()
+
+	t.Run("TRY_SHELL takes priority", func(t *testing.T) {
+		os.Setenv("TRY_SHELL", "/usr/bin/fish")
+		os.Setenv("SHELL", "/bin/bash")
+		got := detectUserShell(nil)
+		if got != "fish" {
+			t.Errorf("detectUserShell() = %q, want %q", got, "fish")
+		}
+	})
+
+	t.Run("config shell as fallback", func(t *testing.T) {
+		os.Unsetenv("TRY_SHELL")
+		os.Setenv("SHELL", "/bin/bash")
+		config := &Config{Shell: "/usr/bin/zsh"}
+		got := detectUserShell(config)
+		if got != "zsh" {
+			t.Errorf("detectUserShell() = %q, want %q", got, "zsh")
+		}
+	})
+
+	t.Run("SHELL env fallback", func(t *testing.T) {
+		os.Unsetenv("TRY_SHELL")
+		os.Setenv("SHELL", "/bin/bash")
+		got := detectUserShell(nil)
+		if got != "bash" {
+			t.Errorf("detectUserShell() = %q, want %q", got, "bash")
+		}
+	})
+
+	t.Run("default to bash", func(t *testing.T) {
+		os.Unsetenv("TRY_SHELL")
+		os.Unsetenv("SHELL")
+		got := detectUserShell(nil)
+		if got != "bash" {
+			t.Errorf("detectUserShell() = %q, want %q", got, "bash")
+		}
+	})
+}
+
+// ============================================================================
+// Wrapper Generation Tests
+// ============================================================================
+
+func TestGenerateBashZshWrapper(t *testing.T) {
+	wrapper := generateBashZshWrapper("/usr/local/bin/try")
+
+	// Check essential parts
+	if !contains(wrapper, "/usr/local/bin/try") {
+		t.Error("wrapper should contain the binary path")
+	}
+	if !contains(wrapper, "--select-only") {
+		t.Error("wrapper should use --select-only flag")
+	}
+	if !contains(wrapper, "cd \"$dir\"") {
+		t.Error("wrapper should cd to the selected directory")
+	}
+}
+
+func TestGenerateFishWrapper(t *testing.T) {
+	wrapper := generateFishWrapper("/usr/local/bin/try")
+
+	// Check essential parts
+	if !contains(wrapper, "/usr/local/bin/try") {
+		t.Error("wrapper should contain the binary path")
+	}
+	if !contains(wrapper, "--select-only") {
+		t.Error("wrapper should use --select-only flag")
+	}
+	if !contains(wrapper, "function try") {
+		t.Error("wrapper should define a fish function")
+	}
+	if !contains(wrapper, "cd $dir") {
+		t.Error("wrapper should cd to the selected directory")
+	}
+}
+
+// Helper function
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+}
+
+func containsHelper(s, substr string) bool {
+	for i := 0; i <= len(s)-len(substr); i++ {
+		if s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
+}

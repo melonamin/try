@@ -111,6 +111,21 @@ release: dist-macos dist-linux
     @ls -lh dist/
 
 
+# Run all tests (unit + integration)
+test: build test-unit test-integration
+
+# Run unit tests only
+test-unit:
+    go test -v ./...
+
+# Run integration tests only
+test-integration: build
+    ./spec/tests/runner.sh ./try
+
+# Run tests with race detection
+test-race:
+    go test -race -v ./...
+
 # Format code
 fmt:
     go fmt ./...
