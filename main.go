@@ -794,33 +794,77 @@ func isValidSearchInput(input string) bool {
 	return len(input) > 0
 }
 
-// Pre-compiled GitHub URL patterns
-var githubPatterns = []struct {
+// Pre-compiled git URL patterns for various hosting services
+// Git URL patterns for various hosting services
+var gitURLPatterns = []struct {
 	regex  *regexp.Regexp
-	format string
+	format string // $1=host or user, $2=path or repo (depends on pattern)
 }{
+	// GitHub patterns
 	{regexp.MustCompile(`^https?://github\.com/([\w-]+)/([\w\.-]+?)(?:\.git)?/?$`), "https://github.com/$1/$2.git"},
 	{regexp.MustCompile(`^github\.com/([\w-]+)/([\w\.-]+?)(?:\.git)?/?$`), "https://github.com/$1/$2.git"},
 	{regexp.MustCompile(`^git@github\.com:([\w-]+)/([\w\.-]+?)(?:\.git)?$`), "https://github.com/$1/$2.git"},
 	{regexp.MustCompile(`^gh:([\w-]+)/([\w\.-]+?)$`), "https://github.com/$1/$2.git"},
+
+	// GitLab patterns
+	{regexp.MustCompile(`^https?://gitlab\.com/([\w-]+(?:/[\w-]+)*)/([\w\.-]+?)(?:\.git)?/?$`), "https://gitlab.com/$1/$2.git"},
+	{regexp.MustCompile(`^gitlab\.com/([\w-]+(?:/[\w-]+)*)/([\w\.-]+?)(?:\.git)?/?$`), "https://gitlab.com/$1/$2.git"},
+	{regexp.MustCompile(`^git@gitlab\.com:([\w-]+(?:/[\w-]+)*)/([\w\.-]+?)(?:\.git)?$`), "https://gitlab.com/$1/$2.git"},
+	{regexp.MustCompile(`^gl:([\w-]+(?:/[\w-]+)*)/([\w\.-]+?)$`), "https://gitlab.com/$1/$2.git"},
+
+	// Bitbucket patterns
+	{regexp.MustCompile(`^https?://bitbucket\.org/([\w-]+)/([\w\.-]+?)(?:\.git)?/?$`), "https://bitbucket.org/$1/$2.git"},
+	{regexp.MustCompile(`^bitbucket\.org/([\w-]+)/([\w\.-]+?)(?:\.git)?/?$`), "https://bitbucket.org/$1/$2.git"},
+	{regexp.MustCompile(`^git@bitbucket\.org:([\w-]+)/([\w\.-]+?)(?:\.git)?$`), "https://bitbucket.org/$1/$2.git"},
+	{regexp.MustCompile(`^bb:([\w-]+)/([\w\.-]+?)$`), "https://bitbucket.org/$1/$2.git"},
 }
 
-// isGitHubURL checks if the text is a GitHub URL and returns normalized clone URL
-func isGitHubURL(text string) (bool, string) {
+// Generic git URL patterns (for any host)
+var genericGitPatterns = []struct {
+	regex *regexp.Regexp
+}{
+	// https://host.com/path/to/repo.git
+	{regexp.MustCompile(`^https?://[\w\.-]+/[\w\.-/]+\.git$`)},
+	// git@host.com:path/to/repo.git
+	{regexp.MustCompile(`^git@[\w\.-]+:[\w\.-/]+\.git$`)},
+	// ssh://git@host.com/path/to/repo.git
+	{regexp.MustCompile(`^ssh://git@[\w\.-]+/[\w\.-/]+\.git$`)},
+}
+
+// isGitURL checks if the text is a git URL and returns normalized clone URL
+// Supports GitHub, GitLab, Bitbucket, and generic git URLs
+func isGitURL(text string) (bool, string) {
 	text = strings.TrimSpace(text)
 
-	for _, p := range githubPatterns {
+	// Check known hosting services first (for normalization)
+	for _, p := range gitURLPatterns {
 		if matches := p.regex.FindStringSubmatch(text); matches != nil {
-			user := matches[1]
-			repo := matches[2]
-			return true, fmt.Sprintf("https://github.com/%s/%s.git", user, repo)
+			// Use the format string to build normalized URL
+			result := p.format
+			for i := 1; i < len(matches); i++ {
+				result = strings.Replace(result, fmt.Sprintf("$%d", i), matches[i], 1)
+			}
+			return true, result
+		}
+	}
+
+	// Check generic git URL patterns (return as-is, already valid git URLs)
+	for _, p := range genericGitPatterns {
+		if p.regex.MatchString(text) {
+			return true, text
 		}
 	}
 
 	return false, ""
 }
 
-// extractRepoName extracts the repository name from a GitHub URL
+// isGitHubURL is kept for backwards compatibility in tests
+// Deprecated: use isGitURL instead
+func isGitHubURL(text string) (bool, string) {
+	return isGitURL(text)
+}
+
+// extractRepoName extracts the repository name from a git URL
 func extractRepoName(url string) string {
 	// Remove .git suffix
 	url = strings.TrimSuffix(url, ".git")
@@ -1532,9 +1576,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+n":
 			// Quick create new experiment or clone
 			if m.searchTerm != "" {
-				// Check if it's a GitHub URL
-				isGH, cloneURL := isGitHubURL(m.searchTerm)
-				if isGH {
+				// Check if it's a git URL (GitHub, GitLab, Bitbucket, etc.)
+				isGit, cloneURL := isGitURL(m.searchTerm)
+				if isGit {
 					// Clone repository
 					repoName := extractRepoName(cloneURL)
 					datePrefix := time.Now().Format("2006-01-02")
@@ -1569,9 +1613,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+t":
 			// Quick create - same as Ctrl+N but more memorable shortcut
 			if m.searchTerm != "" {
-				// Check if it's a GitHub URL
-				isGH, cloneURL := isGitHubURL(m.searchTerm)
-				if isGH {
+				// Check if it's a git URL (GitHub, GitLab, Bitbucket, etc.)
+				isGit, cloneURL := isGitURL(m.searchTerm)
+				if isGit {
 					repoName := extractRepoName(cloneURL)
 					datePrefix := time.Now().Format("2006-01-02")
 					finalName := fmt.Sprintf("%s-%s", datePrefix, repoName)
@@ -1637,9 +1681,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.cursor == len(m.filteredTries) {
 				// Create new directory or clone repository
 				if m.searchTerm != "" {
-					// Check if it's a GitHub URL
-					isGH, cloneURL := isGitHubURL(m.searchTerm)
-					if isGH {
+					// Check if it's a git URL (GitHub, GitLab, Bitbucket, etc.)
+					isGit, cloneURL := isGitURL(m.searchTerm)
+					if isGit {
 						// Clone repository
 						repoName := extractRepoName(cloneURL)
 						datePrefix := time.Now().Format("2006-01-02")
@@ -2046,10 +2090,10 @@ func (m model) formatCreateNew(isSelected bool) string {
 	var displayText string
 	var iconLen int
 
-	// Check if search term is a GitHub URL
-	isGH, cloneURL := isGitHubURL(m.searchTerm)
+	// Check if search term is a git URL
+	isGit, cloneURL := isGitURL(m.searchTerm)
 
-	if isGH {
+	if isGit {
 		result.WriteString("📦 ")
 		iconLen = 2
 		repoName := extractRepoName(cloneURL)
@@ -2126,10 +2170,11 @@ func (m model) formatRelativeTime(t time.Time) string {
 }
 
 func handleDirectClone(url string, config *Config) {
-	// Validate it's a GitHub URL
-	isGH, cloneURL := isGitHubURL(url)
-	if !isGH {
-		fmt.Fprintf(os.Stderr, "Error: Not a valid GitHub URL: %s\n", url)
+	// Validate it's a git URL
+	isGit, cloneURL := isGitURL(url)
+	if !isGit {
+		fmt.Fprintf(os.Stderr, "Error: Not a valid git URL: %s\n", url)
+		fmt.Fprintf(os.Stderr, "Supported formats: https://host/user/repo.git, git@host:user/repo.git\n")
 		os.Exit(1)
 	}
 
@@ -2423,7 +2468,7 @@ func main() {
 			}
 
 		case "clone":
-			// Clone GitHub repository
+			// Clone git repository
 			cloneURL := m.selected.CloneURL
 
 			// Perform the clone
@@ -2523,7 +2568,7 @@ Perfect for people with ADHD who need quick, organized workspaces.
 USAGE:
   try [search_term]           Launch selector with optional search
   try --select-only, -s       Output selected path instead of launching shell
-  try --clone <github-url>    Clone a GitHub repository
+  try --clone <git-url>       Clone a git repository
   try --version, -v           Show version information
   try --help                  Show this help
 
@@ -2542,7 +2587,7 @@ FEATURES:
   • Fuzzy search with smart scoring
   • Automatic date prefixing (YYYY-MM-DD)
   • Time-based sorting (recent = higher)
-  • GitHub repository cloning
+  • Git repository cloning (GitHub, GitLab, Bitbucket, etc.)
   • Git worktree support (GT-compatible)
   • Directory renaming
 
@@ -2577,7 +2622,9 @@ EXAMPLES:
   try neural                               # Launch with search for "neural"
   try new project                          # Search for "new project"
   try github.com/user/repo                 # Shows clone option in TUI
+  try gitlab.com/user/repo                 # GitLab clone option
   try --clone https://github.com/user/repo # Clone directly
+  try --clone git@gitlab.com:user/repo.git # Clone via SSH
   try -s                                   # Select and output path
   cd $(try -s)                             # Use with cd in current shell
   try . feature/my-branch                  # Create worktree for branch

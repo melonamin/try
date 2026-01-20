@@ -175,38 +175,69 @@ func TestRuneLen(t *testing.T) {
 }
 
 // ============================================================================
-// GitHub URL Parsing Tests
+// Git URL Parsing Tests
 // ============================================================================
 
-func TestIsGitHubURL(t *testing.T) {
+func TestIsGitURL(t *testing.T) {
 	tests := []struct {
-		name      string
-		input     string
-		wantIsGH  bool
-		wantURL   string
+		name     string
+		input    string
+		wantIsGit bool
+		wantURL  string
 	}{
-		{"https url", "https://github.com/user/repo", true, "https://github.com/user/repo.git"},
-		{"https url with .git", "https://github.com/user/repo.git", true, "https://github.com/user/repo.git"},
-		{"http url", "http://github.com/user/repo", true, "https://github.com/user/repo.git"},
+		// GitHub patterns
+		{"github https url", "https://github.com/user/repo", true, "https://github.com/user/repo.git"},
+		{"github https url with .git", "https://github.com/user/repo.git", true, "https://github.com/user/repo.git"},
+		{"github http url", "http://github.com/user/repo", true, "https://github.com/user/repo.git"},
 		{"github.com without protocol", "github.com/user/repo", true, "https://github.com/user/repo.git"},
-		{"git@ ssh url", "git@github.com:user/repo.git", true, "https://github.com/user/repo.git"},
+		{"github git@ ssh url", "git@github.com:user/repo.git", true, "https://github.com/user/repo.git"},
 		{"gh: shorthand", "gh:user/repo", true, "https://github.com/user/repo.git"},
-		{"trailing slash", "https://github.com/user/repo/", true, "https://github.com/user/repo.git"},
-		{"not github", "https://gitlab.com/user/repo", false, ""},
+		{"github trailing slash", "https://github.com/user/repo/", true, "https://github.com/user/repo.git"},
+
+		// GitLab patterns
+		{"gitlab https url", "https://gitlab.com/user/repo", true, "https://gitlab.com/user/repo.git"},
+		{"gitlab.com without protocol", "gitlab.com/user/repo", true, "https://gitlab.com/user/repo.git"},
+		{"gitlab git@ ssh url", "git@gitlab.com:user/repo.git", true, "https://gitlab.com/user/repo.git"},
+		{"gl: shorthand", "gl:user/repo", true, "https://gitlab.com/user/repo.git"},
+		{"gitlab nested group", "https://gitlab.com/group/subgroup/repo", true, "https://gitlab.com/group/subgroup/repo.git"},
+
+		// Bitbucket patterns
+		{"bitbucket https url", "https://bitbucket.org/user/repo", true, "https://bitbucket.org/user/repo.git"},
+		{"bitbucket.org without protocol", "bitbucket.org/user/repo", true, "https://bitbucket.org/user/repo.git"},
+		{"bitbucket git@ ssh url", "git@bitbucket.org:user/repo.git", true, "https://bitbucket.org/user/repo.git"},
+		{"bb: shorthand", "bb:user/repo", true, "https://bitbucket.org/user/repo.git"},
+
+		// Generic git URLs (returned as-is)
+		{"generic https .git", "https://git.example.com/user/repo.git", true, "https://git.example.com/user/repo.git"},
+		{"generic git@ ssh", "git@git.example.com:user/repo.git", true, "git@git.example.com:user/repo.git"},
+		{"generic ssh://", "ssh://git@git.example.com/user/repo.git", true, "ssh://git@git.example.com/user/repo.git"},
+
+		// Non-git URLs
 		{"random text", "hello world", false, ""},
 		{"empty", "", false, ""},
+		{"partial url", "github.com", false, ""},
+		{"no repo", "github.com/user", false, ""},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotIsGH, gotURL := isGitHubURL(tt.input)
-			if gotIsGH != tt.wantIsGH {
-				t.Errorf("isGitHubURL() isGH = %v, want %v", gotIsGH, tt.wantIsGH)
+			gotIsGit, gotURL := isGitURL(tt.input)
+			if gotIsGit != tt.wantIsGit {
+				t.Errorf("isGitURL() isGit = %v, want %v", gotIsGit, tt.wantIsGit)
 			}
 			if gotURL != tt.wantURL {
-				t.Errorf("isGitHubURL() url = %q, want %q", gotURL, tt.wantURL)
+				t.Errorf("isGitURL() url = %q, want %q", gotURL, tt.wantURL)
 			}
 		})
+	}
+}
+
+// TestIsGitHubURL tests the backwards compatibility wrapper
+func TestIsGitHubURL(t *testing.T) {
+	// Just verify it calls isGitURL correctly
+	isGit, url := isGitHubURL("https://github.com/user/repo")
+	if !isGit || url != "https://github.com/user/repo.git" {
+		t.Errorf("isGitHubURL() backwards compat failed")
 	}
 }
 
