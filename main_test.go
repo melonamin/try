@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -248,6 +249,13 @@ func TestSanitizeBranchName(t *testing.T) {
 		{"with backslash", "feature\\test", "feature-test"},
 		{"double dots", "feature..test", "feature-test"},
 		{"already clean", "my-feature-branch", "my-feature-branch"},
+		{"with spaces", "feature my branch", "feature-my-branch"},
+		{"with colons", "feature:test:branch", "feature-test-branch"},
+		{"mixed special chars", "feat/my branch:v2", "feat-my-branch-v2"},
+		{"preserves dots and underscores", "feat_1.0", "feat_1.0"},
+		{"leading slash", "/feature", "feature"},
+		{"trailing slash", "feature/", "feature"},
+		{"multiple consecutive dashes", "feature---branch", "feature-branch"},
 	}
 
 	for _, tt := range tests {
@@ -523,13 +531,13 @@ func TestGenerateBashZshWrapper(t *testing.T) {
 	wrapper := generateBashZshWrapper("/usr/local/bin/try")
 
 	// Check essential parts
-	if !contains(wrapper, "/usr/local/bin/try") {
+	if !strings.Contains(wrapper, "/usr/local/bin/try") {
 		t.Error("wrapper should contain the binary path")
 	}
-	if !contains(wrapper, "--select-only") {
+	if !strings.Contains(wrapper, "--select-only") {
 		t.Error("wrapper should use --select-only flag")
 	}
-	if !contains(wrapper, "cd \"$dir\"") {
+	if !strings.Contains(wrapper, "cd \"$dir\"") {
 		t.Error("wrapper should cd to the selected directory")
 	}
 }
@@ -538,30 +546,96 @@ func TestGenerateFishWrapper(t *testing.T) {
 	wrapper := generateFishWrapper("/usr/local/bin/try")
 
 	// Check essential parts
-	if !contains(wrapper, "/usr/local/bin/try") {
+	if !strings.Contains(wrapper, "/usr/local/bin/try") {
 		t.Error("wrapper should contain the binary path")
 	}
-	if !contains(wrapper, "--select-only") {
+	if !strings.Contains(wrapper, "--select-only") {
 		t.Error("wrapper should use --select-only flag")
 	}
-	if !contains(wrapper, "function try") {
+	if !strings.Contains(wrapper, "function try") {
 		t.Error("wrapper should define a fish function")
 	}
-	if !contains(wrapper, "cd $dir") {
+	if !strings.Contains(wrapper, "cd $dir") {
 		t.Error("wrapper should cd to the selected directory")
 	}
 }
 
-// Helper function
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr || len(s) > 0 && containsHelper(s, substr))
+// ============================================================================
+// Shell Escape Tests
+// ============================================================================
+
+func TestShellEscape(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"simple path", "/usr/local/bin/try", "'/usr/local/bin/try'"},
+		{"path with spaces", "/Users/me/My Programs/try", "'/Users/me/My Programs/try'"},
+		{"path with double quotes", `/path/with"quotes/try`, `'/path/with"quotes/try'`},
+		{"path with backslash", `/path\with\backslash`, `'/path\with\backslash'`},
+		{"path with single quote", "/path/with'quote/try", `'/path/with'\''quote/try'`},
+		{"command injection attempt $", "/tmp/try$(rm -rf ~)", "'/tmp/try$(rm -rf ~)'"},
+		{"command injection attempt backtick", "/tmp/try`rm -rf ~`", "'/tmp/try`rm -rf ~`'"},
+		{"empty path", "", "''"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shellEscape(tt.input); got != tt.want {
+				t.Errorf("shellEscape() = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
-func containsHelper(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
+// ============================================================================
+// Rename Validation Tests
+// ============================================================================
+
+func TestValidateRenameName(t *testing.T) {
+	tempDir := t.TempDir()
+
+	// Create an existing directory for collision testing
+	if err := os.MkdirAll(filepath.Join(tempDir, "existing-dir"), 0755); err != nil {
+		t.Fatalf("failed to create existing-dir: %v", err)
 	}
-	return false
+
+	tests := []struct {
+		name          string
+		renameName    string
+		originalName  string
+		basePath      string
+		wantError     bool
+		errorContains string
+	}{
+		{"valid rename", "new-name", "old-name", tempDir, false, ""},
+		{"same name is ok", "same-name", "same-name", tempDir, false, ""},
+		{"empty name", "", "old-name", tempDir, true, "cannot be empty"},
+		{"contains slash", "new/name", "old-name", tempDir, true, "cannot contain"},
+		{"contains backslash", "new\\name", "old-name", tempDir, true, "cannot contain"},
+		{"double dots in name is ok", "v1..v2", "old-name", tempDir, false, ""}, // Not traversal since / is blocked
+		{"exact dot-dot blocked", "..", "old-name", tempDir, true, "Invalid name"},
+		{"exact single dot blocked", ".", "old-name", tempDir, true, "Invalid name"},
+		{"path traversal attempt", "../escape", "old-name", tempDir, true, "cannot contain"},
+		{"collision with existing", "existing-dir", "old-name", tempDir, true, "already exists"},
+		{"null byte blocked", "bad\x00name", "old-name", tempDir, true, "Invalid name"},
+		{"absolute path blocked", "/etc/passwd", "old-name", tempDir, true, "absolute path"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateRenameName(tt.renameName, tt.originalName, tt.basePath)
+			if tt.wantError && err == "" {
+				t.Errorf("validateRenameName() expected error containing %q, got none", tt.errorContains)
+			}
+			if !tt.wantError && err != "" {
+				t.Errorf("validateRenameName() unexpected error: %q", err)
+			}
+			if tt.wantError && tt.errorContains != "" && !strings.Contains(err, tt.errorContains) {
+				t.Errorf("validateRenameName() error = %q, want containing %q", err, tt.errorContains)
+			}
+		})
+	}
 }
+

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -139,8 +140,11 @@ type model struct {
 	renameMode   bool
 	renameTarget *tryEntry
 	renameName   string
+	renameError  string // Validation error message for rename, empty if valid
 	// Text editing cursor position (shared across input modes)
 	cursorPos int
+	// Delete error message to show user
+	deleteError string
 }
 
 type selection struct {
@@ -835,33 +839,26 @@ func cloneRepository(url, targetPath string) error {
 
 	// Create the target directory
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
+		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Clone the repository with timeout
-	cmd := exec.Command("git", "clone", "--depth", "1", url, targetPath)
+	// Clone the repository with context-based timeout
+	ctx, cancel := context.WithTimeout(context.Background(), cloneTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", url, targetPath)
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 
-	// Set a 2-minute timeout for clone operation
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Run()
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			// If clone failed, remove the directory
-			os.RemoveAll(targetPath)
-			return fmt.Errorf("failed to clone repository: %v", err)
-		}
-		return nil
-	case <-time.After(2 * time.Minute):
-		cmd.Process.Kill()
+	if err := cmd.Run(); err != nil {
+		// Clean up on failure
 		os.RemoveAll(targetPath)
-		return fmt.Errorf("clone operation timed out after 2 minutes")
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("clone operation timed out after %v", cloneTimeout)
+		}
+		return fmt.Errorf("failed to clone repository: %w", err)
 	}
+	return nil
 }
 
 // performClone handles the common clone operation logic
@@ -922,15 +919,32 @@ func isGitRepository(path string) (string, bool) {
 	}
 }
 
+// branchSanitizeRegex matches characters that are not safe for filesystem/shell usage
+var branchSanitizeRegex = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
 // sanitizeBranchName converts branch name to filesystem-safe format
-// Replaces / with - to match GT convention
+// Replaces unsafe characters (spaces, /, \, :, etc.) with dashes
 func sanitizeBranchName(branch string) string {
+	// Replace path separators and double dots first
 	sanitized := strings.ReplaceAll(branch, "/", "-")
-	// Remove any other potentially problematic characters
 	sanitized = strings.ReplaceAll(sanitized, "\\", "-")
 	sanitized = strings.ReplaceAll(sanitized, "..", "-")
+	// Replace any remaining unsafe characters (spaces, colons, etc.)
+	sanitized = branchSanitizeRegex.ReplaceAllString(sanitized, "-")
+	// Collapse multiple consecutive dashes into one
+	for strings.Contains(sanitized, "--") {
+		sanitized = strings.ReplaceAll(sanitized, "--", "-")
+	}
+	// Trim leading/trailing dashes
+	sanitized = strings.Trim(sanitized, "-")
 	return sanitized
 }
+
+// Timeout constants for external operations
+const (
+	worktreeTimeout = 2 * time.Minute
+	cloneTimeout    = 2 * time.Minute
+)
 
 // createWorktree creates a git worktree at the target path
 func createWorktree(repoPath, targetPath, branch string) error {
@@ -939,27 +953,21 @@ func createWorktree(repoPath, targetPath, branch string) error {
 		return fmt.Errorf("git is not installed")
 	}
 
-	// Create worktree with detached HEAD (same as GT)
-	cmd := exec.Command("git", "-C", repoPath, "worktree", "add", "--detach", targetPath, branch)
+	// Create worktree with detached HEAD (same as GT) using context for timeout
+	ctx, cancel := context.WithTimeout(context.Background(), worktreeTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "worktree", "add", "--detach", targetPath, branch)
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 
-	// Set a 2-minute timeout for worktree operation
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Run()
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			return fmt.Errorf("failed to create worktree: %v", err)
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("worktree operation timed out after %v", worktreeTimeout)
 		}
-		return nil
-	case <-time.After(2 * time.Minute):
-		cmd.Process.Kill()
-		return fmt.Errorf("worktree operation timed out after 2 minutes")
+		return fmt.Errorf("failed to create worktree: %w", err)
 	}
+	return nil
 }
 
 // ensureGitignore adds .worktrees/ to .gitignore if not already present
@@ -970,7 +978,7 @@ func ensureGitignore(repoPath string) error {
 	// Read existing .gitignore
 	content, err := os.ReadFile(gitignorePath)
 	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to read .gitignore: %v", err)
+		return fmt.Errorf("failed to read .gitignore: %w", err)
 	}
 
 	// Check if entry already exists
@@ -990,7 +998,7 @@ func ensureGitignore(repoPath string) error {
 	}
 
 	if err := os.WriteFile(gitignorePath, []byte(newContent), 0644); err != nil {
-		return fmt.Errorf("failed to write .gitignore: %v", err)
+		return fmt.Errorf("failed to write .gitignore: %w", err)
 	}
 
 	fmt.Printf("📝 Added %s to .gitignore\n", entry)
@@ -1010,7 +1018,7 @@ func performWorktree(repoPath, branch, basePath string, inRepo bool) (string, er
 		// GT-style: .worktrees/branch-name inside the repo
 		worktreesDir := filepath.Join(repoPath, ".worktrees")
 		if err := os.MkdirAll(worktreesDir, 0755); err != nil {
-			return "", fmt.Errorf("failed to create .worktrees directory: %v", err)
+			return "", fmt.Errorf("failed to create .worktrees directory: %w", err)
 		}
 
 		// Add to .gitignore
@@ -1154,8 +1162,57 @@ func detectUserShell(config *Config) string {
 	return "bash"
 }
 
+// validateRenameName checks if a rename target is valid and returns an error message
+func validateRenameName(name, originalName, basePath string) string {
+	if name == "" {
+		return "Name cannot be empty"
+	}
+	if name == originalName {
+		return "" // No change is valid (will just exit rename mode)
+	}
+	// Block null bytes (could truncate path in C-based syscalls)
+	if strings.Contains(name, "\x00") {
+		return "Invalid name"
+	}
+	// Block absolute paths
+	if filepath.IsAbs(name) {
+		return "Name cannot be an absolute path"
+	}
+	// Block path separators
+	if strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		return "Name cannot contain / or \\"
+	}
+	// Block special directory names
+	if name == "." || name == ".." {
+		return "Invalid name"
+	}
+	// Check if cleaned path would escape (handles edge cases)
+	cleaned := filepath.Clean(name)
+	if cleaned != name || strings.HasPrefix(cleaned, "..") {
+		return "Invalid name"
+	}
+	// Check if target already exists
+	newPath := filepath.Join(basePath, name)
+	if _, err := os.Stat(newPath); err == nil {
+		return "A directory with this name already exists"
+	} else if !os.IsNotExist(err) {
+		// Permission error or other issue - report it
+		return fmt.Sprintf("Cannot validate name: %v", err)
+	}
+	return ""
+}
+
+// shellEscape escapes a string for safe use in shell scripts using single quotes.
+// Single quotes prevent all shell expansion ($, `, etc.) - only embedded single
+// quotes need escaping via the '\'' pattern (end quote, literal quote, start quote).
+func shellEscape(s string) string {
+	// Single-quote the entire string, escaping any embedded single quotes
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
 // generateBashZshWrapper generates a shell wrapper for bash or zsh
 func generateBashZshWrapper(tryPath string) string {
+	escapedPath := shellEscape(tryPath)
 	return fmt.Sprintf(`# try shell wrapper - add this to your .bashrc or .zshrc
 try() {
     local dir
@@ -1164,11 +1221,12 @@ try() {
         cd "$dir" || return 1
     fi
 }
-`, tryPath)
+`, escapedPath)
 }
 
 // generateFishWrapper generates a shell wrapper for fish
 func generateFishWrapper(tryPath string) string {
+	escapedPath := shellEscape(tryPath)
 	return fmt.Sprintf(`# try shell wrapper - add this to your config.fish
 function try
     set -l dir (%s --select-only $argv)
@@ -1176,7 +1234,7 @@ function try
         cd $dir
     end
 end
-`, tryPath)
+`, escapedPath)
 }
 
 // handleInitCommand handles the 'try init' command
@@ -1317,11 +1375,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.confirmDelete = false
 				m.deleteTarget = nil
 				m.deleteConfirmBuffer = ""
+				m.deleteError = ""
 
 			case "backspace":
 				if len(m.deleteConfirmBuffer) > 0 {
 					m.deleteConfirmBuffer = m.deleteConfirmBuffer[:len(m.deleteConfirmBuffer)-1]
 				}
+				m.deleteError = "" // Clear error on backspace (user is retrying)
 
 			default:
 				// Handle character input
@@ -1333,13 +1393,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Check if the character matches the expected next character
 					if bufLen < 3 && char == string(expectedChars[bufLen]) {
 						m.deleteConfirmBuffer += char
+						m.deleteError = "" // Clear any previous error
 
 						// Check if confirmation is complete
 						if m.deleteConfirmBuffer == "YES" {
 							// Perform deletion
 							if err := os.RemoveAll(m.deleteTarget.Path); err != nil {
-								m.confirmDelete = false
-								m.deleteTarget = nil
+								// Store error for display instead of silently failing
+								m.deleteError = fmt.Sprintf("Failed to delete: %v", err)
 								m.deleteConfirmBuffer = ""
 								return m, nil
 							}
@@ -1349,6 +1410,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.confirmDelete = false
 							m.deleteTarget = nil
 							m.deleteConfirmBuffer = ""
+							m.deleteError = ""
 							// Adjust cursor if it's out of bounds
 							if m.cursor >= len(m.filteredTries) {
 								m.cursor = len(m.filteredTries) - 1
@@ -1362,12 +1424,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						m.confirmDelete = false
 						m.deleteTarget = nil
 						m.deleteConfirmBuffer = ""
+						m.deleteError = ""
 					}
 				} else {
 					// Non-character key - cancel
 					m.confirmDelete = false
 					m.deleteTarget = nil
 					m.deleteConfirmBuffer = ""
+					m.deleteError = ""
 				}
 			}
 			return m, nil
@@ -1380,23 +1444,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.renameMode = false
 				m.renameTarget = nil
 				m.renameName = ""
+				m.renameError = ""
 				m.cursorPos = 0
 
 			case "enter":
 				// Validate and perform rename
-				if m.renameName != "" && m.renameName != m.renameTarget.Basename {
-					// Check for invalid characters
-					if strings.Contains(m.renameName, "/") || strings.Contains(m.renameName, "\\") {
-						// Invalid name - stay in rename mode (could show error)
-						return m, nil
-					}
-					// Check if target already exists
-					newPath := filepath.Join(m.basePath, m.renameName)
-					if _, err := os.Stat(newPath); err == nil {
-						// Already exists - stay in rename mode
-						return m, nil
-					}
+				m.renameError = validateRenameName(m.renameName, m.renameTarget.Basename, m.basePath)
+				if m.renameError == "" && m.renameName != "" && m.renameName != m.renameTarget.Basename {
 					// Proceed with rename
+					newPath := filepath.Join(m.basePath, m.renameName)
 					m.selected = &selection{
 						Type:    "rename",
 						Path:    newPath,
@@ -1405,14 +1461,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.quitting = true
 					return m, tea.Quit
 				}
-				// Empty or same name - just exit rename mode
-				m.renameMode = false
-				m.renameTarget = nil
-				m.renameName = ""
-				m.cursorPos = 0
+				// If same name or empty, just exit rename mode
+				if m.renameName == "" || m.renameName == m.renameTarget.Basename {
+					m.renameMode = false
+					m.renameTarget = nil
+					m.renameName = ""
+					m.renameError = ""
+					m.cursorPos = 0
+				}
+				// Otherwise stay in rename mode with error
 
 			case "backspace":
 				m.renameName, m.cursorPos = deleteCharBackward(m.renameName, m.cursorPos)
+				m.renameError = validateRenameName(m.renameName, m.renameTarget.Basename, m.basePath)
 
 			// Text editing shortcuts
 			case "ctrl+a":
@@ -1429,8 +1490,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			case "ctrl+k":
 				m.renameName = deleteToEnd(m.renameName, m.cursorPos)
+				m.renameError = validateRenameName(m.renameName, m.renameTarget.Basename, m.basePath)
 			case "ctrl+w":
 				m.renameName, m.cursorPos = deleteWordBackward(m.renameName, m.cursorPos)
+				m.renameError = validateRenameName(m.renameName, m.renameTarget.Basename, m.basePath)
 
 			default:
 				// Handle character input
@@ -1442,6 +1505,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 							m.renameName, m.cursorPos = insertCharAt(m.renameName, m.cursorPos, r)
 						}
 					}
+					m.renameError = validateRenameName(m.renameName, m.renameTarget.Basename, m.basePath)
 				}
 			}
 			return m, nil
@@ -1540,6 +1604,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.renameMode = true
 				m.renameTarget = &entry
 				m.renameName = entry.Basename
+				m.renameError = "" // Initial name is valid (no change)
 				m.cursorPos = runeLen(entry.Basename) // Cursor at end
 			}
 
@@ -1693,6 +1758,11 @@ func (m model) View() string {
 		b.WriteString("\n\n")
 		b.WriteString(dangerStyle.Render("This action cannot be undone!"))
 		b.WriteString("\n\n")
+		// Show error if delete failed
+		if m.deleteError != "" {
+			b.WriteString(dangerStyle.Render("❌ " + m.deleteError))
+			b.WriteString("\n\n")
+		}
 		// Show YES confirmation with typed progress
 		b.WriteString("Type ")
 		b.WriteString(dangerStyle.Render("YES"))
@@ -1722,22 +1792,13 @@ func (m model) View() string {
 		b.WriteString(dimStyle.Render("To:   "))
 		b.WriteString(renderTextWithCursor(m.renameName, m.cursorPos, searchInputStyle, cursorStyle))
 		b.WriteString("\n")
-		// Show validation messages
-		if m.renameName == "" {
-			b.WriteString("\n")
-			b.WriteString(dangerStyle.Render("Name cannot be empty"))
-		} else if m.renameName == m.renameTarget.Basename {
+		// Show validation messages (using cached renameError from Update)
+		if m.renameName == m.renameTarget.Basename {
 			b.WriteString("\n")
 			b.WriteString(dimStyle.Render("(no change)"))
-		} else if strings.Contains(m.renameName, "/") || strings.Contains(m.renameName, "\\") {
+		} else if m.renameError != "" {
 			b.WriteString("\n")
-			b.WriteString(dangerStyle.Render("Name cannot contain / or \\"))
-		} else {
-			newPath := filepath.Join(m.basePath, m.renameName)
-			if _, err := os.Stat(newPath); err == nil {
-				b.WriteString("\n")
-				b.WriteString(dangerStyle.Render("A directory with this name already exists"))
-			}
+			b.WriteString(dangerStyle.Render(m.renameError))
 		}
 		b.WriteString("\n\n")
 		b.WriteString(helpStyle.Render("Enter: Rename  Ctrl-A/E: Start/End  Ctrl-K: Delete to end  ESC: Cancel"))
