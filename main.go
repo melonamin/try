@@ -133,9 +133,11 @@ type model struct {
 	quitting      bool
 	inputMode     bool
 	newName       string
-	confirmDelete       bool
-	deleteTarget        *tryEntry
-	deleteConfirmBuffer string
+	// Delete mode (batch delete)
+	deleteMode          bool     // Whether we're in delete mode (marking items)
+	markedForDeletion   []string // Paths marked for deletion
+	confirmDelete       bool     // Whether we're in the YES confirmation dialog
+	deleteConfirmBuffer string   // Buffer for typing "YES"
 	// Rename mode
 	renameMode   bool
 	renameTarget *tryEntry
@@ -204,6 +206,17 @@ var (
 
 	warningStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("214"))
+
+	// Style for items marked for deletion (red background)
+	markedStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("52")).
+			Foreground(lipgloss.Color("196"))
+
+	// Style for delete mode footer
+	deleteModeStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("52")).
+			Foreground(lipgloss.Color("255")).
+			Bold(true)
 )
 
 func getConfigPath() string {
@@ -365,9 +378,9 @@ func getResolvedConfig() (*Config, error) {
 		config.Path = tryPath
 	}
 
-	if tryShell := os.Getenv("TRY_SHELL"); tryShell != "" {
-		config.Shell = tryShell
-	}
+	// Note: TRY_SHELL is handled directly in detectUserShell()
+	// to allow shell names like "bash" without requiring absolute paths.
+	// Config.Shell (from config file) requires absolute path validation.
 
 	// Validate and sanitize the final config
 	if err := config.Validate(); err != nil {
@@ -1368,12 +1381,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 
-		// Handle delete confirmation mode - requires typing "YES"
-		if m.confirmDelete && m.deleteTarget != nil {
+		// Handle delete confirmation mode - requires typing "YES" for batch delete
+		if m.confirmDelete && len(m.markedForDeletion) > 0 {
 			switch msg.String() {
 			case "ctrl+c", "esc":
+				// Cancel confirmation but stay in delete mode with marks
 				m.confirmDelete = false
-				m.deleteTarget = nil
 				m.deleteConfirmBuffer = ""
 				m.deleteError = ""
 
@@ -1397,20 +1410,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 						// Check if confirmation is complete
 						if m.deleteConfirmBuffer == "YES" {
-							// Perform deletion
-							if err := os.RemoveAll(m.deleteTarget.Path); err != nil {
-								// Store error for display instead of silently failing
-								m.deleteError = fmt.Sprintf("Failed to delete: %v", err)
+							// Perform batch deletion
+							var errors []string
+							for _, path := range m.markedForDeletion {
+								if err := os.RemoveAll(path); err != nil {
+									errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(path), err))
+								}
+							}
+
+							if len(errors) > 0 {
+								m.deleteError = fmt.Sprintf("Failed to delete: %s", strings.Join(errors, "; "))
 								m.deleteConfirmBuffer = ""
 								return m, nil
 							}
+
 							// Reload directories and reset state
 							m.loadTries()
 							m.filterTries()
-							m.confirmDelete = false
-							m.deleteTarget = nil
-							m.deleteConfirmBuffer = ""
-							m.deleteError = ""
+							m.clearDeleteMode()
 							// Adjust cursor if it's out of bounds
 							if m.cursor >= len(m.filteredTries) {
 								m.cursor = len(m.filteredTries) - 1
@@ -1419,20 +1436,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 								}
 							}
 						}
-					} else {
-						// Wrong character - cancel
-						m.confirmDelete = false
-						m.deleteTarget = nil
-						m.deleteConfirmBuffer = ""
-						m.deleteError = ""
 					}
-				} else {
-					// Non-character key - cancel
-					m.confirmDelete = false
-					m.deleteTarget = nil
-					m.deleteConfirmBuffer = ""
-					m.deleteError = ""
+					// Wrong character - just ignore it, stay in confirmation dialog
 				}
+				// Non-character key (other than esc/backspace) - just ignore it
 			}
 			return m, nil
 		}
@@ -1514,6 +1521,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Normal mode
 		switch msg.String() {
 		case "ctrl+c", "esc":
+			// If in delete mode, clear marks and exit delete mode
+			if m.deleteMode {
+				m.clearDeleteMode()
+				return m, nil
+			}
 			m.quitting = true
 			return m, tea.Quit
 
@@ -1589,12 +1601,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.cursorPos = 0
 
 		case "ctrl+d", "delete":
-			// Delete directory with confirmation
+			// Toggle mark for deletion (batch delete mode)
 			if m.cursor < len(m.filteredTries) {
-				m.confirmDelete = true
-				m.deleteConfirmBuffer = ""
 				entry := m.filteredTries[m.cursor]
-				m.deleteTarget = &entry
+				m.toggleMarkForDeletion(entry.Path)
 			}
 
 		case "ctrl+r":
@@ -1609,6 +1619,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 
 		case "enter":
+			// If in delete mode with marked items, trigger confirmation
+			if m.deleteMode && len(m.markedForDeletion) > 0 {
+				m.confirmDelete = true
+				m.deleteConfirmBuffer = ""
+				return m, nil
+			}
+
 			if m.cursor < len(m.filteredTries) {
 				// Select existing directory
 				m.selected = &selection{
@@ -1746,16 +1763,26 @@ func (m model) View() string {
 	b.WriteString(titleStyle.Render("📁 Try - Quick Experiment Directories"))
 	b.WriteString("\n")
 
-	// Handle delete confirmation mode
-	if m.confirmDelete && m.deleteTarget != nil {
+	// Handle delete confirmation mode (batch delete)
+	if m.confirmDelete && len(m.markedForDeletion) > 0 {
 		b.WriteString("\n")
-		b.WriteString(dangerStyle.Render("⚠️  Delete Directory"))
+		if len(m.markedForDeletion) == 1 {
+			b.WriteString(dangerStyle.Render("⚠️  Delete Directory"))
+		} else {
+			b.WriteString(dangerStyle.Render(fmt.Sprintf("⚠️  Delete %d Directories", len(m.markedForDeletion))))
+		}
 		b.WriteString("\n\n")
-		b.WriteString("Are you sure you want to delete this directory?\n\n")
-		b.WriteString(warningStyle.Render("  " + m.deleteTarget.Name))
+		if len(m.markedForDeletion) == 1 {
+			b.WriteString("Are you sure you want to delete this directory?\n\n")
+		} else {
+			b.WriteString("Are you sure you want to delete these directories?\n\n")
+		}
+		// List all marked items
+		for _, path := range m.markedForDeletion {
+			b.WriteString(warningStyle.Render("  🗑️ " + filepath.Base(path)))
+			b.WriteString("\n")
+		}
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("  " + m.deleteTarget.Path))
-		b.WriteString("\n\n")
 		b.WriteString(dangerStyle.Render("This action cannot be undone!"))
 		b.WriteString("\n\n")
 		// Show error if delete failed
@@ -1863,7 +1890,8 @@ func (m model) View() string {
 		// Display entry
 		if idx < len(m.filteredTries) {
 			entry := m.filteredTries[idx]
-			line := m.formatEntry(entry, isSelected)
+			isMarked := m.isMarkedForDeletion(entry.Path)
+			line := m.formatEntry(entry, isSelected, isMarked)
 			b.WriteString(line)
 		} else {
 			// Create new option
@@ -1883,11 +1911,23 @@ func (m model) View() string {
 
 	b.WriteString(m.separatorLine())
 	b.WriteString("\n")
-	// Navigation hints
-	b.WriteString(helpStyle.Render("↑↓: Navigate  Enter: Select  Ctrl+N/T: New  Ctrl+R: Rename  Ctrl+D: Delete"))
-	b.WriteString("\n")
-	// Action hints
-	b.WriteString(helpStyle.Render("Ctrl+A/E/B/F/W: Edit text  Ctrl+U: Clear  ESC: Quit"))
+
+	// Show different footer based on mode
+	if m.deleteMode {
+		// Delete mode footer
+		b.WriteString(deleteModeStyle.Render(" DELETE MODE "))
+		b.WriteString(" ")
+		b.WriteString(dangerStyle.Render(fmt.Sprintf("%d marked", len(m.markedForDeletion))))
+		b.WriteString("  |  ")
+		b.WriteString(helpStyle.Render("Ctrl+D: Toggle  Enter: Confirm  Esc: Cancel"))
+	} else {
+		// Normal footer
+		// Navigation hints
+		b.WriteString(helpStyle.Render("↑↓: Navigate  Enter: Select  Ctrl+N/T: New  Ctrl+R: Rename  Ctrl+D: Delete"))
+		b.WriteString("\n")
+		// Action hints
+		b.WriteString(helpStyle.Render("Ctrl+A/E/B/F/W: Edit text  Ctrl+U: Clear  ESC: Quit"))
+	}
 
 	return b.String()
 }
@@ -1900,11 +1940,52 @@ func (m model) separatorLine() string {
 	return separatorStyle.Render(strings.Repeat("─", width))
 }
 
-func (m model) formatEntry(entry tryEntry, isSelected bool) string {
+// isMarkedForDeletion checks if a path is marked for deletion
+func (m model) isMarkedForDeletion(path string) bool {
+	for _, p := range m.markedForDeletion {
+		if p == path {
+			return true
+		}
+	}
+	return false
+}
+
+// toggleMarkForDeletion toggles the deletion mark on a path
+func (m *model) toggleMarkForDeletion(path string) {
+	for i, p := range m.markedForDeletion {
+		if p == path {
+			// Remove from slice
+			m.markedForDeletion = append(m.markedForDeletion[:i], m.markedForDeletion[i+1:]...)
+			// Exit delete mode if no more marks
+			if len(m.markedForDeletion) == 0 {
+				m.deleteMode = false
+			}
+			return
+		}
+	}
+	// Add to slice
+	m.markedForDeletion = append(m.markedForDeletion, path)
+	m.deleteMode = true
+}
+
+// clearDeleteMode clears all marks and exits delete mode
+func (m *model) clearDeleteMode() {
+	m.markedForDeletion = nil
+	m.deleteMode = false
+	m.confirmDelete = false
+	m.deleteConfirmBuffer = ""
+	m.deleteError = ""
+}
+
+func (m model) formatEntry(entry tryEntry, isSelected bool, isMarked bool) string {
 	var result strings.Builder
 
-	// Icon
-	result.WriteString("📁 ")
+	// Icon - use different icon for marked items
+	if isMarked {
+		result.WriteString("🗑️ ")
+	} else {
+		result.WriteString("📁 ")
+	}
 
 	// Parse and format the name
 	name := entry.Basename
@@ -1916,7 +1997,10 @@ func (m model) formatEntry(entry tryEntry, isSelected bool) string {
 		datePart := strings.Join(parts[:3], "-")
 		namePart := strings.Join(parts[3:], "-")
 
-		if isSelected {
+		if isMarked {
+			// Marked items get danger style
+			displayName = markedStyle.Render(datePart + "-" + namePart)
+		} else if isSelected {
 			displayName = selectedStyle.Render(
 				dateStyle.Render(datePart) +
 					dimStyle.Render("-") +
@@ -1928,7 +2012,9 @@ func (m model) formatEntry(entry tryEntry, isSelected bool) string {
 		}
 	} else {
 		// Regular name
-		if isSelected {
+		if isMarked {
+			displayName = markedStyle.Render(name)
+		} else if isSelected {
 			displayName = selectedStyle.Render(m.highlightMatches(name))
 		} else {
 			displayName = m.highlightMatches(name)
@@ -2465,7 +2551,7 @@ NAVIGATION:
   Ctrl+j/k     Navigate entries (vim-style)
   Enter        Select directory or create new
   Ctrl+N/T     Create new experiment (quick)
-  Ctrl+D       Delete selected directory (requires typing YES)
+  Ctrl+D       Toggle mark for deletion (batch delete mode)
   Ctrl+R       Rename selected directory
   Backspace    Delete search character
   Ctrl+U       Clear search
