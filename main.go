@@ -21,11 +21,11 @@ import (
 
 // Configuration constants
 const (
-	version          = "0.2.1"
-	defaultShell     = "/bin/bash"
-	defaultTriesDir  = "src/tries"
-	configFileName   = "config"
-	configDirName    = ".config/try"
+	version         = "0.2.1"
+	defaultShell    = "/bin/bash"
+	defaultTriesDir = "src/tries"
+	configFileName  = "config"
+	configDirName   = ".config/try"
 )
 
 type Config struct {
@@ -434,7 +434,7 @@ func promptForPath() string {
 	}
 	fmt.Printf("Current SHELL: %s\n", dimStyle.Render(currentShell))
 	fmt.Print("Override shell (press Enter to use $SHELL): ")
-	
+
 	shellInput, err := reader.ReadString('\n')
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "\nError reading input: %v\n", err)
@@ -646,7 +646,7 @@ func isAlphaNum(r rune) bool {
 func isValidSearchInput(input string) bool {
 	for _, char := range input {
 		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
-			(char >= '0' && char <= '9') || 
+			(char >= '0' && char <= '9') ||
 			char == '-' || char == '_' || char == '.' || char == ' ' ||
 			char == ':' || char == '/' || char == '@') {
 			return false
@@ -669,7 +669,7 @@ var githubPatterns = []struct {
 // isGitHubURL checks if the text is a GitHub URL and returns normalized clone URL
 func isGitHubURL(text string) (bool, string) {
 	text = strings.TrimSpace(text)
-	
+
 	for _, p := range githubPatterns {
 		if matches := p.regex.FindStringSubmatch(text); matches != nil {
 			user := matches[1]
@@ -677,7 +677,7 @@ func isGitHubURL(text string) (bool, string) {
 			return true, fmt.Sprintf("https://github.com/%s/%s.git", user, repo)
 		}
 	}
-	
+
 	return false, ""
 }
 
@@ -685,7 +685,7 @@ func isGitHubURL(text string) (bool, string) {
 func extractRepoName(url string) string {
 	// Remove .git suffix
 	url = strings.TrimSuffix(url, ".git")
-	
+
 	// Extract repo name from URL
 	parts := strings.Split(url, "/")
 	if len(parts) >= 2 {
@@ -700,7 +700,7 @@ func extractRepoName(url string) string {
 		}
 		return repoName
 	}
-	
+
 	return "repo"
 }
 
@@ -710,23 +710,23 @@ func cloneRepository(url, targetPath string) error {
 	if _, err := exec.LookPath("git"); err != nil {
 		return fmt.Errorf("git is not installed")
 	}
-	
+
 	// Create the target directory
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
-	
+
 	// Clone the repository with timeout
 	cmd := exec.Command("git", "clone", "--depth", "1", url, targetPath)
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
-	
+
 	// Set a 2-minute timeout for clone operation
 	done := make(chan error, 1)
 	go func() {
 		done <- cmd.Run()
 	}()
-	
+
 	select {
 	case err := <-done:
 		if err != nil {
@@ -749,7 +749,7 @@ func performClone(cloneURL, basePath string) (string, error) {
 	datePrefix := time.Now().Format("2006-01-02")
 	dirName := fmt.Sprintf("%s-%s", datePrefix, repoName)
 	fullPath := filepath.Join(basePath, dirName)
-	
+
 	// Check if directory already exists
 	if _, err := os.Stat(fullPath); err == nil {
 		// Add a number suffix if it exists
@@ -762,13 +762,13 @@ func performClone(cloneURL, basePath string) (string, error) {
 			}
 		}
 	}
-	
+
 	// Clone the repository
 	fmt.Printf("📦 Cloning %s into %s...\n", cloneURL, dirName)
 	if err := cloneRepository(cloneURL, fullPath); err != nil {
 		return "", err
 	}
-	
+
 	return fullPath, nil
 }
 
@@ -779,8 +779,17 @@ func (m model) Init() tea.Cmd {
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
-		m.width = msg.Width
-		m.height = msg.Height
+		// Clamp to sane minimums to avoid rendering issues on zero-sized TTYs.
+		if msg.Width > 0 {
+			m.width = msg.Width
+		} else {
+			m.width = 1
+		}
+		if msg.Height > 0 {
+			m.height = msg.Height
+		} else {
+			m.height = 1
+		}
 
 	case tea.KeyMsg:
 		// Handle input mode for new directory name
@@ -1044,7 +1053,7 @@ func (m model) View() string {
 		return b.String()
 	}
 
-	b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
+	b.WriteString(m.separatorLine())
 	b.WriteString("\n")
 
 	// Search input
@@ -1054,7 +1063,7 @@ func (m model) View() string {
 		b.WriteString(dimStyle.Render(" (type to filter)"))
 	}
 	b.WriteString("\n")
-	b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
+	b.WriteString(m.separatorLine())
 	b.WriteString("\n")
 
 	// Calculate visible window (accounting for extra help lines and separators)
@@ -1099,13 +1108,13 @@ func (m model) View() string {
 
 	// Scroll indicator
 	if totalItems > maxVisible {
-		b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
+		b.WriteString(m.separatorLine())
 		b.WriteString("\n")
 		b.WriteString(dimStyle.Render(fmt.Sprintf("[%d-%d/%d]", m.scrollOffset+1, visibleEnd, totalItems)))
 		b.WriteString("\n")
 	}
 
-	b.WriteString(separatorStyle.Render(strings.Repeat("─", m.width-1)))
+	b.WriteString(m.separatorLine())
 	b.WriteString("\n")
 	// Navigation hints
 	b.WriteString(helpStyle.Render("↑↓/Ctrl+j,k: Navigate Enter: Select Ctrl+N: Quick new Ctrl+D: Delete"))
@@ -1114,6 +1123,14 @@ func (m model) View() string {
 	b.WriteString(helpStyle.Render("ESC/q: Quit"))
 
 	return b.String()
+}
+
+func (m model) separatorLine() string {
+	width := m.width - 1
+	if width < 0 {
+		width = 0
+	}
+	return separatorStyle.Render(strings.Repeat("─", width))
 }
 
 func (m model) formatEntry(entry tryEntry, isSelected bool) string {
@@ -1178,7 +1195,7 @@ func (m model) formatCreateNew(isSelected bool) string {
 
 	// Check if search term is a GitHub URL
 	isGH, cloneURL := isGitHubURL(m.searchTerm)
-	
+
 	if isGH {
 		result.WriteString("📦 ")
 		iconLen = 2
@@ -1374,14 +1391,21 @@ func main() {
 
 	// Run the TUI
 	m := initialModel(searchTerm, config)
+	tty, ttyErr := openTTY()
 	var p *tea.Program
-	if selectOnly {
-		// Output TUI to stderr so stdout can be piped
-		// Force colors by setting the color profile globally
-		lipgloss.SetColorProfile(termenv.ANSI256)
-		p = tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(os.Stderr))
+	if ttyErr != nil {
+		if selectOnly {
+			lipgloss.SetColorProfile(termenv.ANSI256)
+			p = tea.NewProgram(m, tea.WithAltScreen(), tea.WithOutput(os.Stderr))
+		} else {
+			p = tea.NewProgram(m, tea.WithAltScreen())
+		}
 	} else {
-		p = tea.NewProgram(m, tea.WithAltScreen())
+		defer tty.Close()
+		if selectOnly {
+			lipgloss.SetColorProfile(termenv.ANSI256)
+		}
+		p = tea.NewProgram(m, tea.WithAltScreen(), tea.WithInput(tty), tea.WithOutput(tty))
 	}
 
 	finalModel, err := p.Run()
@@ -1479,7 +1503,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error launching shell: %v\n", err)
 				os.Exit(1)
 			}
-			
+
 		case "clone":
 			// Clone GitHub repository
 			cloneURL := m.selected.CloneURL
@@ -1505,15 +1529,15 @@ func main() {
 
 			// Launch a new shell
 			shell := getShell(m.config)
-			
+
 			fmt.Printf("\n✨ Successfully cloned and entering %s\n\n", filepath.Base(targetPath))
-			
+
 			cmd := exec.Command(shell)
 			cmd.Stdin = os.Stdin
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			cmd.Dir = targetPath
-			
+
 			if err := cmd.Run(); err != nil {
 				fmt.Fprintf(os.Stderr, "Error launching shell: %v\n", err)
 				os.Exit(1)
@@ -1606,4 +1630,10 @@ func checkTTYRequirements(selectOnly bool) bool {
 	}
 	// Normal mode requires stdin and stdout to be TTY
 	return isatty(os.Stdin.Fd()) && isatty(os.Stdout.Fd())
+}
+
+// openTTY opens the controlling terminal for stable input/output handling.
+// Falls back to the existing stdin/stdout if unavailable.
+func openTTY() (*os.File, error) {
+	return os.OpenFile("/dev/tty", os.O_RDWR, 0)
 }
