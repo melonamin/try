@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -132,14 +133,27 @@ type model struct {
 	quitting      bool
 	inputMode     bool
 	newName       string
-	confirmDelete bool
-	deleteTarget  *tryEntry
+	// Delete mode (batch delete)
+	deleteMode          bool     // Whether we're in delete mode (marking items)
+	markedForDeletion   []string // Paths marked for deletion
+	confirmDelete       bool     // Whether we're in the YES confirmation dialog
+	deleteConfirmBuffer string   // Buffer for typing "YES"
+	// Rename mode
+	renameMode   bool
+	renameTarget *tryEntry
+	renameName   string
+	renameError  string // Validation error message for rename, empty if valid
+	// Text editing cursor position (shared across input modes)
+	cursorPos int
+	// Delete error message to show user
+	deleteError string
 }
 
 type selection struct {
 	Type     string
 	Path     string
 	CloneURL string // For clone operations
+	OldPath  string // For rename operations
 }
 
 var (
@@ -192,6 +206,17 @@ var (
 
 	warningStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("214"))
+
+	// Style for items marked for deletion (red background)
+	markedStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("52")).
+			Foreground(lipgloss.Color("196"))
+
+	// Style for delete mode footer
+	deleteModeStyle = lipgloss.NewStyle().
+			Background(lipgloss.Color("52")).
+			Foreground(lipgloss.Color("255")).
+			Bold(true)
 )
 
 func getConfigPath() string {
@@ -353,9 +378,9 @@ func getResolvedConfig() (*Config, error) {
 		config.Path = tryPath
 	}
 
-	if tryShell := os.Getenv("TRY_SHELL"); tryShell != "" {
-		config.Shell = tryShell
-	}
+	// Note: TRY_SHELL is handled directly in detectUserShell()
+	// to allow shell names like "bash" without requiring absolute paths.
+	// Config.Shell (from config file) requires absolute path validation.
 
 	// Validate and sanitize the final config
 	if err := config.Validate(); err != nil {
@@ -642,6 +667,120 @@ func isAlphaNum(r rune) bool {
 	return (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
 }
 
+// Text editing helper functions for cursor-aware editing
+
+// insertCharAt inserts a character at the cursor position and returns the new string and cursor
+func insertCharAt(text string, pos int, char rune) (string, int) {
+	runes := []rune(text)
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(runes) {
+		pos = len(runes)
+	}
+	newRunes := make([]rune, len(runes)+1)
+	copy(newRunes[:pos], runes[:pos])
+	newRunes[pos] = char
+	copy(newRunes[pos+1:], runes[pos:])
+	return string(newRunes), pos + 1
+}
+
+// insertStringAt inserts a string at the cursor position and returns the new string and cursor
+func insertStringAt(text string, pos int, insert string) (string, int) {
+	runes := []rune(text)
+	insertRunes := []rune(insert)
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(runes) {
+		pos = len(runes)
+	}
+	newRunes := make([]rune, len(runes)+len(insertRunes))
+	copy(newRunes[:pos], runes[:pos])
+	copy(newRunes[pos:], insertRunes)
+	copy(newRunes[pos+len(insertRunes):], runes[pos:])
+	return string(newRunes), pos + len(insertRunes)
+}
+
+// deleteCharBackward deletes the character before the cursor and returns the new string and cursor
+func deleteCharBackward(text string, pos int) (string, int) {
+	runes := []rune(text)
+	if pos <= 0 || pos > len(runes) {
+		return text, pos
+	}
+	newRunes := make([]rune, len(runes)-1)
+	copy(newRunes[:pos-1], runes[:pos-1])
+	copy(newRunes[pos-1:], runes[pos:])
+	return string(newRunes), pos - 1
+}
+
+// deleteToEnd deletes from cursor to end of line and returns the new string
+func deleteToEnd(text string, pos int) string {
+	runes := []rune(text)
+	if pos < 0 {
+		pos = 0
+	}
+	if pos >= len(runes) {
+		return text
+	}
+	return string(runes[:pos])
+}
+
+// deleteWordBackward deletes the word before the cursor and returns the new string and cursor
+func deleteWordBackward(text string, pos int) (string, int) {
+	runes := []rune(text)
+	if pos <= 0 || pos > len(runes) {
+		return text, pos
+	}
+
+	// Skip any trailing spaces
+	newPos := pos
+	for newPos > 0 && runes[newPos-1] == ' ' {
+		newPos--
+	}
+
+	// Delete until next space or beginning
+	for newPos > 0 && runes[newPos-1] != ' ' {
+		newPos--
+	}
+
+	newRunes := make([]rune, len(runes)-(pos-newPos))
+	copy(newRunes[:newPos], runes[:newPos])
+	copy(newRunes[newPos:], runes[pos:])
+	return string(newRunes), newPos
+}
+
+// runeLen returns the number of runes in a string
+func runeLen(s string) int {
+	return len([]rune(s))
+}
+
+// renderTextWithCursor renders text with a block cursor at the given position
+func renderTextWithCursor(text string, pos int, textStyle, cursorStyle lipgloss.Style) string {
+	runes := []rune(text)
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(runes) {
+		pos = len(runes)
+	}
+
+	var result strings.Builder
+	for i, r := range runes {
+		if i == pos {
+			// Render cursor character with cursor style
+			result.WriteString(cursorStyle.Render(string(r)))
+		} else {
+			result.WriteString(textStyle.Render(string(r)))
+		}
+	}
+	// If cursor is at end, show a block cursor
+	if pos == len(runes) {
+		result.WriteString(cursorStyle.Render(" "))
+	}
+	return result.String()
+}
+
 // isValidSearchInput checks if the input string contains only valid characters for search
 func isValidSearchInput(input string) bool {
 	for _, char := range input {
@@ -655,33 +794,77 @@ func isValidSearchInput(input string) bool {
 	return len(input) > 0
 }
 
-// Pre-compiled GitHub URL patterns
-var githubPatterns = []struct {
+// Pre-compiled git URL patterns for various hosting services
+// Git URL patterns for various hosting services
+var gitURLPatterns = []struct {
 	regex  *regexp.Regexp
-	format string
+	format string // $1=host or user, $2=path or repo (depends on pattern)
 }{
+	// GitHub patterns
 	{regexp.MustCompile(`^https?://github\.com/([\w-]+)/([\w\.-]+?)(?:\.git)?/?$`), "https://github.com/$1/$2.git"},
 	{regexp.MustCompile(`^github\.com/([\w-]+)/([\w\.-]+?)(?:\.git)?/?$`), "https://github.com/$1/$2.git"},
 	{regexp.MustCompile(`^git@github\.com:([\w-]+)/([\w\.-]+?)(?:\.git)?$`), "https://github.com/$1/$2.git"},
 	{regexp.MustCompile(`^gh:([\w-]+)/([\w\.-]+?)$`), "https://github.com/$1/$2.git"},
+
+	// GitLab patterns
+	{regexp.MustCompile(`^https?://gitlab\.com/([\w-]+(?:/[\w-]+)*)/([\w\.-]+?)(?:\.git)?/?$`), "https://gitlab.com/$1/$2.git"},
+	{regexp.MustCompile(`^gitlab\.com/([\w-]+(?:/[\w-]+)*)/([\w\.-]+?)(?:\.git)?/?$`), "https://gitlab.com/$1/$2.git"},
+	{regexp.MustCompile(`^git@gitlab\.com:([\w-]+(?:/[\w-]+)*)/([\w\.-]+?)(?:\.git)?$`), "https://gitlab.com/$1/$2.git"},
+	{regexp.MustCompile(`^gl:([\w-]+(?:/[\w-]+)*)/([\w\.-]+?)$`), "https://gitlab.com/$1/$2.git"},
+
+	// Bitbucket patterns
+	{regexp.MustCompile(`^https?://bitbucket\.org/([\w-]+)/([\w\.-]+?)(?:\.git)?/?$`), "https://bitbucket.org/$1/$2.git"},
+	{regexp.MustCompile(`^bitbucket\.org/([\w-]+)/([\w\.-]+?)(?:\.git)?/?$`), "https://bitbucket.org/$1/$2.git"},
+	{regexp.MustCompile(`^git@bitbucket\.org:([\w-]+)/([\w\.-]+?)(?:\.git)?$`), "https://bitbucket.org/$1/$2.git"},
+	{regexp.MustCompile(`^bb:([\w-]+)/([\w\.-]+?)$`), "https://bitbucket.org/$1/$2.git"},
 }
 
-// isGitHubURL checks if the text is a GitHub URL and returns normalized clone URL
-func isGitHubURL(text string) (bool, string) {
+// Generic git URL patterns (for any host)
+var genericGitPatterns = []struct {
+	regex *regexp.Regexp
+}{
+	// https://host.com/path/to/repo.git
+	{regexp.MustCompile(`^https?://[\w\.-]+/[\w\.-/]+\.git$`)},
+	// git@host.com:path/to/repo.git
+	{regexp.MustCompile(`^git@[\w\.-]+:[\w\.-/]+\.git$`)},
+	// ssh://git@host.com/path/to/repo.git
+	{regexp.MustCompile(`^ssh://git@[\w\.-]+/[\w\.-/]+\.git$`)},
+}
+
+// isGitURL checks if the text is a git URL and returns normalized clone URL
+// Supports GitHub, GitLab, Bitbucket, and generic git URLs
+func isGitURL(text string) (bool, string) {
 	text = strings.TrimSpace(text)
 
-	for _, p := range githubPatterns {
+	// Check known hosting services first (for normalization)
+	for _, p := range gitURLPatterns {
 		if matches := p.regex.FindStringSubmatch(text); matches != nil {
-			user := matches[1]
-			repo := matches[2]
-			return true, fmt.Sprintf("https://github.com/%s/%s.git", user, repo)
+			// Use the format string to build normalized URL
+			result := p.format
+			for i := 1; i < len(matches); i++ {
+				result = strings.Replace(result, fmt.Sprintf("$%d", i), matches[i], 1)
+			}
+			return true, result
+		}
+	}
+
+	// Check generic git URL patterns (return as-is, already valid git URLs)
+	for _, p := range genericGitPatterns {
+		if p.regex.MatchString(text) {
+			return true, text
 		}
 	}
 
 	return false, ""
 }
 
-// extractRepoName extracts the repository name from a GitHub URL
+// isGitHubURL is kept for backwards compatibility in tests
+// Deprecated: use isGitURL instead
+func isGitHubURL(text string) (bool, string) {
+	return isGitURL(text)
+}
+
+// extractRepoName extracts the repository name from a git URL
 func extractRepoName(url string) string {
 	// Remove .git suffix
 	url = strings.TrimSuffix(url, ".git")
@@ -713,33 +896,26 @@ func cloneRepository(url, targetPath string) error {
 
 	// Create the target directory
 	if err := os.MkdirAll(targetPath, 0755); err != nil {
-		return fmt.Errorf("failed to create directory: %v", err)
+		return fmt.Errorf("failed to create directory: %w", err)
 	}
 
-	// Clone the repository with timeout
-	cmd := exec.Command("git", "clone", "--depth", "1", url, targetPath)
+	// Clone the repository with context-based timeout
+	ctx, cancel := context.WithTimeout(context.Background(), cloneTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "clone", "--depth", "1", url, targetPath)
 	cmd.Stderr = os.Stderr
 	cmd.Stdout = os.Stdout
 
-	// Set a 2-minute timeout for clone operation
-	done := make(chan error, 1)
-	go func() {
-		done <- cmd.Run()
-	}()
-
-	select {
-	case err := <-done:
-		if err != nil {
-			// If clone failed, remove the directory
-			os.RemoveAll(targetPath)
-			return fmt.Errorf("failed to clone repository: %v", err)
-		}
-		return nil
-	case <-time.After(2 * time.Minute):
-		cmd.Process.Kill()
+	if err := cmd.Run(); err != nil {
+		// Clean up on failure
 		os.RemoveAll(targetPath)
-		return fmt.Errorf("clone operation timed out after 2 minutes")
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("clone operation timed out after %v", cloneTimeout)
+		}
+		return fmt.Errorf("failed to clone repository: %w", err)
 	}
+	return nil
 }
 
 // performClone handles the common clone operation logic
@@ -772,6 +948,409 @@ func performClone(cloneURL, basePath string) (string, error) {
 	return fullPath, nil
 }
 
+// Git worktree support functions
+
+// isGitRepository checks if the given path is inside a git repository
+func isGitRepository(path string) (string, bool) {
+	// Walk up the directory tree looking for .git
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", false
+	}
+
+	for {
+		gitPath := filepath.Join(absPath, ".git")
+		if info, err := os.Stat(gitPath); err == nil {
+			// .git can be a directory (normal repo) or a file (worktree)
+			if info.IsDir() || info.Mode().IsRegular() {
+				return absPath, true
+			}
+		}
+
+		parent := filepath.Dir(absPath)
+		if parent == absPath {
+			// Reached root
+			return "", false
+		}
+		absPath = parent
+	}
+}
+
+// branchSanitizeRegex matches characters that are not safe for filesystem/shell usage
+var branchSanitizeRegex = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+// sanitizeBranchName converts branch name to filesystem-safe format
+// Replaces unsafe characters (spaces, /, \, :, etc.) with dashes
+func sanitizeBranchName(branch string) string {
+	// Replace path separators and double dots first
+	sanitized := strings.ReplaceAll(branch, "/", "-")
+	sanitized = strings.ReplaceAll(sanitized, "\\", "-")
+	sanitized = strings.ReplaceAll(sanitized, "..", "-")
+	// Replace any remaining unsafe characters (spaces, colons, etc.)
+	sanitized = branchSanitizeRegex.ReplaceAllString(sanitized, "-")
+	// Collapse multiple consecutive dashes into one
+	for strings.Contains(sanitized, "--") {
+		sanitized = strings.ReplaceAll(sanitized, "--", "-")
+	}
+	// Trim leading/trailing dashes
+	sanitized = strings.Trim(sanitized, "-")
+	return sanitized
+}
+
+// Timeout constants for external operations
+const (
+	worktreeTimeout = 2 * time.Minute
+	cloneTimeout    = 2 * time.Minute
+)
+
+// createWorktree creates a git worktree at the target path
+func createWorktree(repoPath, targetPath, branch string) error {
+	// Check if git is available
+	if _, err := exec.LookPath("git"); err != nil {
+		return fmt.Errorf("git is not installed")
+	}
+
+	// Create worktree with detached HEAD (same as GT) using context for timeout
+	ctx, cancel := context.WithTimeout(context.Background(), worktreeTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "git", "-C", repoPath, "worktree", "add", "--detach", targetPath, branch)
+	cmd.Stderr = os.Stderr
+	cmd.Stdout = os.Stdout
+
+	if err := cmd.Run(); err != nil {
+		if ctx.Err() == context.DeadlineExceeded {
+			return fmt.Errorf("worktree operation timed out after %v", worktreeTimeout)
+		}
+		return fmt.Errorf("failed to create worktree: %w", err)
+	}
+	return nil
+}
+
+// ensureGitignore adds .worktrees/ to .gitignore if not already present
+func ensureGitignore(repoPath string) error {
+	gitignorePath := filepath.Join(repoPath, ".gitignore")
+	entry := ".worktrees/"
+
+	// Read existing .gitignore
+	content, err := os.ReadFile(gitignorePath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read .gitignore: %w", err)
+	}
+
+	// Check if entry already exists
+	lines := strings.Split(string(content), "\n")
+	for _, line := range lines {
+		if strings.TrimSpace(line) == entry {
+			return nil // Already present
+		}
+	}
+
+	// Append entry
+	var newContent string
+	if len(content) > 0 && !strings.HasSuffix(string(content), "\n") {
+		newContent = string(content) + "\n" + entry + "\n"
+	} else {
+		newContent = string(content) + entry + "\n"
+	}
+
+	if err := os.WriteFile(gitignorePath, []byte(newContent), 0644); err != nil {
+		return fmt.Errorf("failed to write .gitignore: %w", err)
+	}
+
+	fmt.Printf("📝 Added %s to .gitignore\n", entry)
+	return nil
+}
+
+// performWorktree handles the worktree creation logic
+// If inRepo is true, creates in .worktrees/ inside the repo (GT-style)
+// Otherwise, creates in basePath with date prefix (Ruby try style)
+func performWorktree(repoPath, branch, basePath string, inRepo bool) (string, error) {
+	sanitizedBranch := sanitizeBranchName(branch)
+
+	var targetPath string
+	var dirName string
+
+	if inRepo {
+		// GT-style: .worktrees/branch-name inside the repo
+		worktreesDir := filepath.Join(repoPath, ".worktrees")
+		if err := os.MkdirAll(worktreesDir, 0755); err != nil {
+			return "", fmt.Errorf("failed to create .worktrees directory: %w", err)
+		}
+
+		// Add to .gitignore
+		if err := ensureGitignore(repoPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+		}
+
+		dirName = sanitizedBranch
+		targetPath = filepath.Join(worktreesDir, sanitizedBranch)
+	} else {
+		// Ruby try style: date-prefix in TRY_PATH
+		datePrefix := time.Now().Format("2006-01-02")
+		dirName = fmt.Sprintf("%s-%s", datePrefix, sanitizedBranch)
+		targetPath = filepath.Join(basePath, dirName)
+	}
+
+	// Check if target already exists
+	if _, err := os.Stat(targetPath); err == nil {
+		if inRepo {
+			return "", fmt.Errorf("worktree already exists: %s", targetPath)
+		}
+		// Add a number suffix for non-inRepo mode
+		for i := 2; ; i++ {
+			testPath := fmt.Sprintf("%s-%d", targetPath, i)
+			if _, err := os.Stat(testPath); os.IsNotExist(err) {
+				targetPath = testPath
+				dirName = fmt.Sprintf("%s-%d", dirName, i)
+				break
+			}
+		}
+	}
+
+	// Create the worktree
+	fmt.Printf("🌳 Creating worktree for %s in %s...\n", branch, dirName)
+	if err := createWorktree(repoPath, targetPath, branch); err != nil {
+		return "", err
+	}
+
+	return targetPath, nil
+}
+
+// handleDirectWorktree handles the CLI worktree command
+func handleDirectWorktree(repoArg, branch string, inRepo bool, config *Config) {
+	var repoPath string
+	var basePath string
+
+	// Determine the repository path
+	if repoArg == "." || repoArg == "" {
+		// Use current directory
+		cwd, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: couldn't get current directory: %v\n", err)
+			os.Exit(1)
+		}
+		foundRepo, isRepo := isGitRepository(cwd)
+		if !isRepo {
+			fmt.Fprintf(os.Stderr, "Error: not inside a git repository\n")
+			os.Exit(1)
+		}
+		repoPath = foundRepo
+	} else {
+		// Use specified path
+		absPath, err := filepath.Abs(repoArg)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid path: %v\n", err)
+			os.Exit(1)
+		}
+		foundRepo, isRepo := isGitRepository(absPath)
+		if !isRepo {
+			fmt.Fprintf(os.Stderr, "Error: %s is not a git repository\n", repoArg)
+			os.Exit(1)
+		}
+		repoPath = foundRepo
+	}
+
+	// Get base path for non-inRepo mode
+	if !inRepo {
+		basePath = getDefaultPath(config)
+		if basePath == "" {
+			basePath = promptForPath()
+			var err error
+			config, err = getResolvedConfig()
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error: failed to reload config: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
+
+	// Perform the worktree creation
+	targetPath, err := performWorktree(repoPath, branch, basePath, inRepo)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Change to the worktree directory
+	if err := os.Chdir(targetPath); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: couldn't change directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Launch a new shell
+	shell := getShell(config)
+
+	fmt.Printf("\n🌳 Worktree created and entering %s\n\n", filepath.Base(targetPath))
+
+	cmd := exec.Command(shell)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Dir = targetPath
+
+	if err := cmd.Run(); err != nil {
+		fmt.Fprintf(os.Stderr, "Error launching shell: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+// Shell init functions
+
+// detectUserShell determines the user's shell for wrapper generation
+// Priority: TRY_SHELL env > config file > $SHELL > default
+func detectUserShell(config *Config) string {
+	// Check TRY_SHELL environment variable
+	if tryShell := os.Getenv("TRY_SHELL"); tryShell != "" {
+		return filepath.Base(tryShell)
+	}
+
+	// Check config file
+	if config != nil && config.Shell != "" {
+		return filepath.Base(config.Shell)
+	}
+
+	// Check $SHELL environment variable
+	if shell := os.Getenv("SHELL"); shell != "" {
+		return filepath.Base(shell)
+	}
+
+	// Default to bash
+	return "bash"
+}
+
+// validateRenameName checks if a rename target is valid and returns an error message
+func validateRenameName(name, originalName, basePath string) string {
+	if name == "" {
+		return "Name cannot be empty"
+	}
+	if name == originalName {
+		return "" // No change is valid (will just exit rename mode)
+	}
+	// Block null bytes (could truncate path in C-based syscalls)
+	if strings.Contains(name, "\x00") {
+		return "Invalid name"
+	}
+	// Block absolute paths
+	if filepath.IsAbs(name) {
+		return "Name cannot be an absolute path"
+	}
+	// Block path separators
+	if strings.Contains(name, "/") || strings.Contains(name, "\\") {
+		return "Name cannot contain / or \\"
+	}
+	// Block special directory names
+	if name == "." || name == ".." {
+		return "Invalid name"
+	}
+	// Check if cleaned path would escape (handles edge cases)
+	cleaned := filepath.Clean(name)
+	if cleaned != name || strings.HasPrefix(cleaned, "..") {
+		return "Invalid name"
+	}
+	// Check if target already exists
+	newPath := filepath.Join(basePath, name)
+	if _, err := os.Stat(newPath); err == nil {
+		return "A directory with this name already exists"
+	} else if !os.IsNotExist(err) {
+		// Permission error or other issue - report it
+		return fmt.Sprintf("Cannot validate name: %v", err)
+	}
+	return ""
+}
+
+// shellEscape escapes a string for safe use in shell scripts using single quotes.
+// Single quotes prevent all shell expansion ($, `, etc.) - only embedded single
+// quotes need escaping via the '\'' pattern (end quote, literal quote, start quote).
+func shellEscape(s string) string {
+	// Single-quote the entire string, escaping any embedded single quotes
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// generateBashZshWrapper generates a shell wrapper for bash or zsh
+func generateBashZshWrapper(tryPath string) string {
+	escapedPath := shellEscape(tryPath)
+	return fmt.Sprintf(`# try shell wrapper - add this to your .bashrc or .zshrc
+try() {
+    local dir
+    dir=$(%s --select-only "$@")
+    if [[ $? -eq 0 && -n "$dir" ]]; then
+        cd "$dir" || return 1
+    fi
+}
+`, escapedPath)
+}
+
+// generateFishWrapper generates a shell wrapper for fish
+func generateFishWrapper(tryPath string) string {
+	escapedPath := shellEscape(tryPath)
+	return fmt.Sprintf(`# try shell wrapper - add this to your config.fish
+function try
+    set -l dir (%s --select-only $argv)
+    if test $status -eq 0 -a -n "$dir"
+        cd $dir
+    end
+end
+`, escapedPath)
+}
+
+// handleInitCommand handles the 'try init' command
+func handleInitCommand(customPath string, config *Config) {
+	// Determine the path to the try binary
+	var tryPath string
+	if customPath != "" {
+		absPath, err := filepath.Abs(customPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: invalid path: %v\n", err)
+			os.Exit(1)
+		}
+		tryPath = absPath
+	} else {
+		// Try to find the current executable
+		execPath, err := os.Executable()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: couldn't determine executable path: %v\n", err)
+			fmt.Fprintln(os.Stderr, "Please specify the path: try init /path/to/try")
+			os.Exit(1)
+		}
+		tryPath, err = filepath.EvalSymlinks(execPath)
+		if err != nil {
+			tryPath = execPath
+		}
+	}
+
+	// Detect shell
+	shell := detectUserShell(config)
+
+	fmt.Printf("🐚 Detected shell: %s\n\n", shell)
+
+	var wrapper string
+	var configFile string
+
+	switch shell {
+	case "fish":
+		wrapper = generateFishWrapper(tryPath)
+		home, _ := os.UserHomeDir()
+		configFile = filepath.Join(home, ".config", "fish", "config.fish")
+	case "zsh":
+		wrapper = generateBashZshWrapper(tryPath)
+		home, _ := os.UserHomeDir()
+		configFile = filepath.Join(home, ".zshrc")
+	default: // bash and others
+		wrapper = generateBashZshWrapper(tryPath)
+		home, _ := os.UserHomeDir()
+		configFile = filepath.Join(home, ".bashrc")
+	}
+
+	fmt.Println("Add the following to your shell configuration:")
+	fmt.Println()
+	fmt.Println(wrapper)
+	fmt.Printf("Suggested config file: %s\n\n", dimStyle.Render(configFile))
+	fmt.Println("After adding the wrapper, restart your shell or run:")
+	fmt.Printf("  source %s\n\n", configFile)
+	fmt.Println("Then you can use 'try' to change directories instead of spawning a subshell.")
+}
+
 func (m model) Init() tea.Cmd {
 	return tea.EnterAltScreen
 }
@@ -798,6 +1377,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "ctrl+c", "esc":
 				m.inputMode = false
 				m.newName = ""
+				m.cursorPos = 0
 
 			case "enter":
 				if m.newName != "" {
@@ -813,46 +1393,171 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 
 			case "backspace":
-				if len(m.newName) > 0 {
-					m.newName = m.newName[:len(m.newName)-1]
+				m.newName, m.cursorPos = deleteCharBackward(m.newName, m.cursorPos)
+
+			// Text editing shortcuts
+			case "ctrl+a":
+				m.cursorPos = 0
+			case "ctrl+e":
+				m.cursorPos = runeLen(m.newName)
+			case "ctrl+b", "left":
+				if m.cursorPos > 0 {
+					m.cursorPos--
 				}
+			case "ctrl+f", "right":
+				if m.cursorPos < runeLen(m.newName) {
+					m.cursorPos++
+				}
+			case "ctrl+k":
+				m.newName = deleteToEnd(m.newName, m.cursorPos)
+			case "ctrl+w":
+				m.newName, m.cursorPos = deleteWordBackward(m.newName, m.cursorPos)
 
 			default:
-				// Handle character input
-				if len(msg.String()) == 1 {
-					m.newName += msg.String()
+				// Handle character input (including paste)
+				switch msg.Type {
+				case tea.KeyRunes:
+					for _, r := range msg.Runes {
+						m.newName, m.cursorPos = insertCharAt(m.newName, m.cursorPos, r)
+					}
 				}
 			}
 			return m, nil
 		}
 
-		// Handle delete confirmation mode
-		if m.confirmDelete && m.deleteTarget != nil {
+		// Handle delete confirmation mode - requires typing "YES" for batch delete
+		if m.confirmDelete && len(m.markedForDeletion) > 0 {
 			switch msg.String() {
-			case "y", "Y":
-				// Perform deletion
-				if err := os.RemoveAll(m.deleteTarget.Path); err != nil {
-					// Could add error handling here, but for now just reset
-					m.confirmDelete = false
-					m.deleteTarget = nil
-					return m, nil
-				}
-				// Reload directories and reset state
-				m.loadTries()
-				m.filterTries()
+			case "ctrl+c", "esc":
+				// Cancel confirmation but stay in delete mode with marks
 				m.confirmDelete = false
-				m.deleteTarget = nil
-				// Adjust cursor if it's out of bounds
-				if m.cursor >= len(m.filteredTries) {
-					m.cursor = len(m.filteredTries) - 1
-					if m.cursor < 0 {
-						m.cursor = 0
-					}
+				m.deleteConfirmBuffer = ""
+				m.deleteError = ""
+
+			case "backspace":
+				if len(m.deleteConfirmBuffer) > 0 {
+					m.deleteConfirmBuffer = m.deleteConfirmBuffer[:len(m.deleteConfirmBuffer)-1]
 				}
+				m.deleteError = "" // Clear error on backspace (user is retrying)
+
 			default:
-				// Cancel deletion on any other key
-				m.confirmDelete = false
-				m.deleteTarget = nil
+				// Handle character input
+				if msg.Type == tea.KeyRunes && len(msg.Runes) == 1 {
+					char := string(msg.Runes[0])
+					expectedChars := "YES"
+					bufLen := len(m.deleteConfirmBuffer)
+
+					// Check if the character matches the expected next character
+					if bufLen < 3 && char == string(expectedChars[bufLen]) {
+						m.deleteConfirmBuffer += char
+						m.deleteError = "" // Clear any previous error
+
+						// Check if confirmation is complete
+						if m.deleteConfirmBuffer == "YES" {
+							// Perform batch deletion
+							var errors []string
+							for _, path := range m.markedForDeletion {
+								if err := os.RemoveAll(path); err != nil {
+									errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(path), err))
+								}
+							}
+
+							if len(errors) > 0 {
+								m.deleteError = fmt.Sprintf("Failed to delete: %s", strings.Join(errors, "; "))
+								m.deleteConfirmBuffer = ""
+								return m, nil
+							}
+
+							// Reload directories and reset state
+							m.loadTries()
+							m.filterTries()
+							m.clearDeleteMode()
+							// Adjust cursor if it's out of bounds
+							if m.cursor >= len(m.filteredTries) {
+								m.cursor = len(m.filteredTries) - 1
+								if m.cursor < 0 {
+									m.cursor = 0
+								}
+							}
+						}
+					}
+					// Wrong character - just ignore it, stay in confirmation dialog
+				}
+				// Non-character key (other than esc/backspace) - just ignore it
+			}
+			return m, nil
+		}
+
+		// Handle rename mode
+		if m.renameMode && m.renameTarget != nil {
+			switch msg.String() {
+			case "ctrl+c", "esc":
+				m.renameMode = false
+				m.renameTarget = nil
+				m.renameName = ""
+				m.renameError = ""
+				m.cursorPos = 0
+
+			case "enter":
+				// Validate and perform rename
+				m.renameError = validateRenameName(m.renameName, m.renameTarget.Basename, m.basePath)
+				if m.renameError == "" && m.renameName != "" && m.renameName != m.renameTarget.Basename {
+					// Proceed with rename
+					newPath := filepath.Join(m.basePath, m.renameName)
+					m.selected = &selection{
+						Type:    "rename",
+						Path:    newPath,
+						OldPath: m.renameTarget.Path,
+					}
+					m.quitting = true
+					return m, tea.Quit
+				}
+				// If same name or empty, just exit rename mode
+				if m.renameName == "" || m.renameName == m.renameTarget.Basename {
+					m.renameMode = false
+					m.renameTarget = nil
+					m.renameName = ""
+					m.renameError = ""
+					m.cursorPos = 0
+				}
+				// Otherwise stay in rename mode with error
+
+			case "backspace":
+				m.renameName, m.cursorPos = deleteCharBackward(m.renameName, m.cursorPos)
+				m.renameError = validateRenameName(m.renameName, m.renameTarget.Basename, m.basePath)
+
+			// Text editing shortcuts
+			case "ctrl+a":
+				m.cursorPos = 0
+			case "ctrl+e":
+				m.cursorPos = runeLen(m.renameName)
+			case "ctrl+b", "left":
+				if m.cursorPos > 0 {
+					m.cursorPos--
+				}
+			case "ctrl+f", "right":
+				if m.cursorPos < runeLen(m.renameName) {
+					m.cursorPos++
+				}
+			case "ctrl+k":
+				m.renameName = deleteToEnd(m.renameName, m.cursorPos)
+				m.renameError = validateRenameName(m.renameName, m.renameTarget.Basename, m.basePath)
+			case "ctrl+w":
+				m.renameName, m.cursorPos = deleteWordBackward(m.renameName, m.cursorPos)
+				m.renameError = validateRenameName(m.renameName, m.renameTarget.Basename, m.basePath)
+
+			default:
+				// Handle character input
+				switch msg.Type {
+				case tea.KeyRunes:
+					for _, r := range msg.Runes {
+						// Don't allow / or \ in names
+						if r != '/' && r != '\\' {
+							m.renameName, m.cursorPos = insertCharAt(m.renameName, m.cursorPos, r)
+						}
+					}
+					m.renameError = validateRenameName(m.renameName, m.renameTarget.Basename, m.basePath)
+				}
 			}
 			return m, nil
 		}
@@ -860,15 +1565,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// Normal mode
 		switch msg.String() {
 		case "ctrl+c", "esc":
+			// If in delete mode, clear marks and exit delete mode
+			if m.deleteMode {
+				m.clearDeleteMode()
+				return m, nil
+			}
 			m.quitting = true
 			return m, tea.Quit
 
 		case "ctrl+n":
 			// Quick create new experiment or clone
 			if m.searchTerm != "" {
-				// Check if it's a GitHub URL
-				isGH, cloneURL := isGitHubURL(m.searchTerm)
-				if isGH {
+				// Check if it's a git URL (GitHub, GitLab, Bitbucket, etc.)
+				isGit, cloneURL := isGitURL(m.searchTerm)
+				if isGit {
 					// Clone repository
 					repoName := extractRepoName(cloneURL)
 					datePrefix := time.Now().Format("2006-01-02")
@@ -897,17 +1607,69 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// Enter input mode for new name
 				m.inputMode = true
 				m.newName = ""
+				m.cursorPos = 0
 			}
 
+		case "ctrl+t":
+			// Quick create - same as Ctrl+N but more memorable shortcut
+			if m.searchTerm != "" {
+				// Check if it's a git URL (GitHub, GitLab, Bitbucket, etc.)
+				isGit, cloneURL := isGitURL(m.searchTerm)
+				if isGit {
+					repoName := extractRepoName(cloneURL)
+					datePrefix := time.Now().Format("2006-01-02")
+					finalName := fmt.Sprintf("%s-%s", datePrefix, repoName)
+					fullPath := filepath.Join(m.basePath, finalName)
+					m.selected = &selection{
+						Type:     "clone",
+						Path:     fullPath,
+						CloneURL: cloneURL,
+					}
+					m.quitting = true
+					return m, tea.Quit
+				}
+				// Regular create
+				datePrefix := time.Now().Format("2006-01-02")
+				finalName := fmt.Sprintf("%s-%s", datePrefix, strings.ReplaceAll(m.searchTerm, " ", "-"))
+				fullPath := filepath.Join(m.basePath, finalName)
+				m.selected = &selection{
+					Type: "mkdir",
+					Path: fullPath,
+				}
+				m.quitting = true
+				return m, tea.Quit
+			}
+			// Enter input mode for new name
+			m.inputMode = true
+			m.newName = ""
+			m.cursorPos = 0
+
 		case "ctrl+d", "delete":
-			// Delete directory with confirmation
+			// Toggle mark for deletion (batch delete mode)
 			if m.cursor < len(m.filteredTries) {
-				m.confirmDelete = true
 				entry := m.filteredTries[m.cursor]
-				m.deleteTarget = &entry
+				m.toggleMarkForDeletion(entry.Path)
+			}
+
+		case "ctrl+r":
+			// Rename directory
+			if m.cursor < len(m.filteredTries) {
+				entry := m.filteredTries[m.cursor]
+				m.renameMode = true
+				m.renameTarget = &entry
+				m.renameName = entry.Basename
+				m.renameError = "" // Initial name is valid (no change)
+				m.cursorPos = runeLen(entry.Basename) // Cursor at end
 			}
 
 		case "enter":
+			// If in delete mode with marked items, trigger confirmation
+			if m.deleteMode && len(m.markedForDeletion) > 0 {
+				m.confirmDelete = true
+				m.deleteConfirmBuffer = ""
+				return m, nil
+			}
+
 			if m.cursor < len(m.filteredTries) {
 				// Select existing directory
 				m.selected = &selection{
@@ -919,9 +1681,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else if m.cursor == len(m.filteredTries) {
 				// Create new directory or clone repository
 				if m.searchTerm != "" {
-					// Check if it's a GitHub URL
-					isGH, cloneURL := isGitHubURL(m.searchTerm)
-					if isGH {
+					// Check if it's a git URL (GitHub, GitLab, Bitbucket, etc.)
+					isGit, cloneURL := isGitURL(m.searchTerm)
+					if isGit {
 						// Clone repository
 						repoName := extractRepoName(cloneURL)
 						datePrefix := time.Now().Format("2006-01-02")
@@ -950,6 +1712,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					// Enter input mode for new name
 					m.inputMode = true
 					m.newName = ""
+					m.cursorPos = 0
 				}
 			}
 
@@ -968,7 +1731,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		case "backspace":
 			if len(m.searchTerm) > 0 {
-				m.searchTerm = m.searchTerm[:len(m.searchTerm)-1]
+				m.searchTerm, m.cursorPos = deleteCharBackward(m.searchTerm, m.cursorPos)
 				m.filterTries()
 				m.cursor = 0
 				m.scrollOffset = 0
@@ -977,6 +1740,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+u":
 			// Clear search
 			m.searchTerm = ""
+			m.cursorPos = 0
+			m.filterTries()
+			m.cursor = 0
+			m.scrollOffset = 0
+
+		// Search term text editing shortcuts
+		case "ctrl+a":
+			m.cursorPos = 0
+		case "ctrl+e":
+			m.cursorPos = runeLen(m.searchTerm)
+		case "ctrl+b", "left":
+			if m.cursorPos > 0 {
+				m.cursorPos--
+			}
+		case "ctrl+f", "right":
+			if m.cursorPos < runeLen(m.searchTerm) {
+				m.cursorPos++
+			}
+		case "ctrl+w":
+			m.searchTerm, m.cursorPos = deleteWordBackward(m.searchTerm, m.cursorPos)
 			m.filterTries()
 			m.cursor = 0
 			m.scrollOffset = 0
@@ -988,7 +1771,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				// This handles both single chars and pasted content
 				input := string(msg.Runes)
 				if isValidSearchInput(input) {
-					m.searchTerm += input
+					m.searchTerm, m.cursorPos = insertStringAt(m.searchTerm, m.cursorPos, input)
 					m.filterTries()
 					m.cursor = 0
 					m.scrollOffset = 0
@@ -1024,19 +1807,72 @@ func (m model) View() string {
 	b.WriteString(titleStyle.Render("📁 Try - Quick Experiment Directories"))
 	b.WriteString("\n")
 
-	// Handle delete confirmation mode
-	if m.confirmDelete && m.deleteTarget != nil {
+	// Handle delete confirmation mode (batch delete)
+	if m.confirmDelete && len(m.markedForDeletion) > 0 {
 		b.WriteString("\n")
-		b.WriteString(dangerStyle.Render("⚠️  Delete Directory"))
+		if len(m.markedForDeletion) == 1 {
+			b.WriteString(dangerStyle.Render("⚠️  Delete Directory"))
+		} else {
+			b.WriteString(dangerStyle.Render(fmt.Sprintf("⚠️  Delete %d Directories", len(m.markedForDeletion))))
+		}
 		b.WriteString("\n\n")
-		b.WriteString("Are you sure you want to delete this directory?\n\n")
-		b.WriteString(warningStyle.Render("  " + m.deleteTarget.Name))
+		if len(m.markedForDeletion) == 1 {
+			b.WriteString("Are you sure you want to delete this directory?\n\n")
+		} else {
+			b.WriteString("Are you sure you want to delete these directories?\n\n")
+		}
+		// List all marked items
+		for _, path := range m.markedForDeletion {
+			b.WriteString(warningStyle.Render("  🗑️ " + filepath.Base(path)))
+			b.WriteString("\n")
+		}
 		b.WriteString("\n")
-		b.WriteString(dimStyle.Render("  " + m.deleteTarget.Path))
-		b.WriteString("\n\n")
 		b.WriteString(dangerStyle.Render("This action cannot be undone!"))
 		b.WriteString("\n\n")
-		b.WriteString(helpStyle.Render("Press 'y' to confirm, any other key to cancel"))
+		// Show error if delete failed
+		if m.deleteError != "" {
+			b.WriteString(dangerStyle.Render("❌ " + m.deleteError))
+			b.WriteString("\n\n")
+		}
+		// Show YES confirmation with typed progress
+		b.WriteString("Type ")
+		b.WriteString(dangerStyle.Render("YES"))
+		b.WriteString(" to confirm: ")
+		for i, char := range "YES" {
+			if i < len(m.deleteConfirmBuffer) {
+				b.WriteString(createNewStyle.Render(string(char)))
+			} else if i == len(m.deleteConfirmBuffer) {
+				b.WriteString(cursorStyle.Render(string(char)))
+			} else {
+				b.WriteString(dimStyle.Render(string(char)))
+			}
+		}
+		b.WriteString("\n\n")
+		b.WriteString(helpStyle.Render("ESC: Cancel"))
+		return b.String()
+	}
+
+	// Handle rename mode
+	if m.renameMode && m.renameTarget != nil {
+		b.WriteString("\n")
+		b.WriteString(promptStyle.Render("Rename directory:"))
+		b.WriteString("\n\n")
+		b.WriteString(dimStyle.Render("From: "))
+		b.WriteString(warningStyle.Render(m.renameTarget.Basename))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("To:   "))
+		b.WriteString(renderTextWithCursor(m.renameName, m.cursorPos, searchInputStyle, cursorStyle))
+		b.WriteString("\n")
+		// Show validation messages (using cached renameError from Update)
+		if m.renameName == m.renameTarget.Basename {
+			b.WriteString("\n")
+			b.WriteString(dimStyle.Render("(no change)"))
+		} else if m.renameError != "" {
+			b.WriteString("\n")
+			b.WriteString(dangerStyle.Render(m.renameError))
+		}
+		b.WriteString("\n\n")
+		b.WriteString(helpStyle.Render("Enter: Rename  Ctrl-A/E: Start/End  Ctrl-K: Delete to end  ESC: Cancel"))
 		return b.String()
 	}
 
@@ -1047,20 +1883,22 @@ func (m model) View() string {
 		b.WriteString("\n")
 		datePrefix := time.Now().Format("2006-01-02")
 		b.WriteString(dimStyle.Render(datePrefix + "-"))
-		b.WriteString(searchInputStyle.Render(m.newName))
+		b.WriteString(renderTextWithCursor(m.newName, m.cursorPos, searchInputStyle, cursorStyle))
 		b.WriteString("\n\n")
-		b.WriteString(helpStyle.Render("Enter: Create  ESC: Cancel"))
+		b.WriteString(helpStyle.Render("Enter: Create  Ctrl-A/E: Start/End  Ctrl-K: Delete to end  ESC: Cancel"))
 		return b.String()
 	}
 
 	b.WriteString(m.separatorLine())
 	b.WriteString("\n")
 
-	// Search input
+	// Search input with cursor
 	b.WriteString(searchStyle.Render("Search: "))
-	b.WriteString(searchInputStyle.Render(m.searchTerm))
 	if m.searchTerm == "" {
-		b.WriteString(dimStyle.Render(" (type to filter)"))
+		b.WriteString(cursorStyle.Render(" "))
+		b.WriteString(dimStyle.Render("(type to filter)"))
+	} else {
+		b.WriteString(renderTextWithCursor(m.searchTerm, m.cursorPos, searchInputStyle, cursorStyle))
 	}
 	b.WriteString("\n")
 	b.WriteString(m.separatorLine())
@@ -1096,7 +1934,8 @@ func (m model) View() string {
 		// Display entry
 		if idx < len(m.filteredTries) {
 			entry := m.filteredTries[idx]
-			line := m.formatEntry(entry, isSelected)
+			isMarked := m.isMarkedForDeletion(entry.Path)
+			line := m.formatEntry(entry, isSelected, isMarked)
 			b.WriteString(line)
 		} else {
 			// Create new option
@@ -1116,11 +1955,23 @@ func (m model) View() string {
 
 	b.WriteString(m.separatorLine())
 	b.WriteString("\n")
-	// Navigation hints
-	b.WriteString(helpStyle.Render("↑↓/Ctrl+j,k: Navigate Enter: Select Ctrl+N: Quick new Ctrl+D: Delete"))
-	b.WriteString("\n")
-	// Action hints
-	b.WriteString(helpStyle.Render("ESC/q: Quit"))
+
+	// Show different footer based on mode
+	if m.deleteMode {
+		// Delete mode footer
+		b.WriteString(deleteModeStyle.Render(" DELETE MODE "))
+		b.WriteString(" ")
+		b.WriteString(dangerStyle.Render(fmt.Sprintf("%d marked", len(m.markedForDeletion))))
+		b.WriteString("  |  ")
+		b.WriteString(helpStyle.Render("Ctrl+D: Toggle  Enter: Confirm  Esc: Cancel"))
+	} else {
+		// Normal footer
+		// Navigation hints
+		b.WriteString(helpStyle.Render("↑↓: Navigate  Enter: Select  Ctrl+N/T: New  Ctrl+R: Rename  Ctrl+D: Delete"))
+		b.WriteString("\n")
+		// Action hints
+		b.WriteString(helpStyle.Render("Ctrl+A/E/B/F/W: Edit text  Ctrl+U: Clear  ESC: Quit"))
+	}
 
 	return b.String()
 }
@@ -1133,11 +1984,52 @@ func (m model) separatorLine() string {
 	return separatorStyle.Render(strings.Repeat("─", width))
 }
 
-func (m model) formatEntry(entry tryEntry, isSelected bool) string {
+// isMarkedForDeletion checks if a path is marked for deletion
+func (m model) isMarkedForDeletion(path string) bool {
+	for _, p := range m.markedForDeletion {
+		if p == path {
+			return true
+		}
+	}
+	return false
+}
+
+// toggleMarkForDeletion toggles the deletion mark on a path
+func (m *model) toggleMarkForDeletion(path string) {
+	for i, p := range m.markedForDeletion {
+		if p == path {
+			// Remove from slice
+			m.markedForDeletion = append(m.markedForDeletion[:i], m.markedForDeletion[i+1:]...)
+			// Exit delete mode if no more marks
+			if len(m.markedForDeletion) == 0 {
+				m.deleteMode = false
+			}
+			return
+		}
+	}
+	// Add to slice
+	m.markedForDeletion = append(m.markedForDeletion, path)
+	m.deleteMode = true
+}
+
+// clearDeleteMode clears all marks and exits delete mode
+func (m *model) clearDeleteMode() {
+	m.markedForDeletion = nil
+	m.deleteMode = false
+	m.confirmDelete = false
+	m.deleteConfirmBuffer = ""
+	m.deleteError = ""
+}
+
+func (m model) formatEntry(entry tryEntry, isSelected bool, isMarked bool) string {
 	var result strings.Builder
 
-	// Icon
-	result.WriteString("📁 ")
+	// Icon - use different icon for marked items
+	if isMarked {
+		result.WriteString("🗑️ ")
+	} else {
+		result.WriteString("📁 ")
+	}
 
 	// Parse and format the name
 	name := entry.Basename
@@ -1149,7 +2041,10 @@ func (m model) formatEntry(entry tryEntry, isSelected bool) string {
 		datePart := strings.Join(parts[:3], "-")
 		namePart := strings.Join(parts[3:], "-")
 
-		if isSelected {
+		if isMarked {
+			// Marked items get danger style
+			displayName = markedStyle.Render(datePart + "-" + namePart)
+		} else if isSelected {
 			displayName = selectedStyle.Render(
 				dateStyle.Render(datePart) +
 					dimStyle.Render("-") +
@@ -1161,7 +2056,9 @@ func (m model) formatEntry(entry tryEntry, isSelected bool) string {
 		}
 	} else {
 		// Regular name
-		if isSelected {
+		if isMarked {
+			displayName = markedStyle.Render(name)
+		} else if isSelected {
 			displayName = selectedStyle.Render(m.highlightMatches(name))
 		} else {
 			displayName = m.highlightMatches(name)
@@ -1193,10 +2090,10 @@ func (m model) formatCreateNew(isSelected bool) string {
 	var displayText string
 	var iconLen int
 
-	// Check if search term is a GitHub URL
-	isGH, cloneURL := isGitHubURL(m.searchTerm)
+	// Check if search term is a git URL
+	isGit, cloneURL := isGitURL(m.searchTerm)
 
-	if isGH {
+	if isGit {
 		result.WriteString("📦 ")
 		iconLen = 2
 		repoName := extractRepoName(cloneURL)
@@ -1273,10 +2170,11 @@ func (m model) formatRelativeTime(t time.Time) string {
 }
 
 func handleDirectClone(url string, config *Config) {
-	// Validate it's a GitHub URL
-	isGH, cloneURL := isGitHubURL(url)
-	if !isGH {
-		fmt.Fprintf(os.Stderr, "Error: Not a valid GitHub URL: %s\n", url)
+	// Validate it's a git URL
+	isGit, cloneURL := isGitURL(url)
+	if !isGit {
+		fmt.Fprintf(os.Stderr, "Error: Not a valid git URL: %s\n", url)
+		fmt.Fprintf(os.Stderr, "Supported formats: https://host/user/repo.git, git@host:user/repo.git\n")
 		os.Exit(1)
 	}
 
@@ -1330,29 +2228,82 @@ func main() {
 	showVersion := false
 	cloneURL := ""
 	selectOnly := false
+	// Worktree mode
+	worktreeMode := false
+	worktreeRepo := ""
+	worktreeBranch := ""
+	worktreeInRepo := false
+	// Init command
+	initMode := false
+	initPath := ""
 
 	args := os.Args[1:]
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		switch arg {
-		case "--help", "-h", "help":
-			showHelp = true
-		case "--version", "-v":
-			showVersion = true
-		case "--select-only", "-s":
-			selectOnly = true
-		case "--clone", "-c":
-			// Get the next argument as the URL
-			if i+1 < len(args) {
-				cloneURL = args[i+1]
-				i++ // Skip the URL argument
+
+	// Check for worktree patterns first
+	// try worktree <branch>
+	// try worktree --in-repo <branch>
+	// try . <branch>
+	// try . --in-repo <branch>
+	// try ./path <branch>
+	if len(args) >= 2 {
+		firstArg := args[0]
+		if firstArg == "worktree" || firstArg == "." || strings.HasPrefix(firstArg, "./") || strings.HasPrefix(firstArg, "/") {
+			worktreeMode = true
+			if firstArg == "worktree" {
+				worktreeRepo = "."
 			} else {
-				fmt.Fprintln(os.Stderr, "Error: --clone requires a URL argument")
+				worktreeRepo = firstArg
+			}
+
+			// Parse remaining args
+			for i := 1; i < len(args); i++ {
+				arg := args[i]
+				if arg == "--in-repo" {
+					worktreeInRepo = true
+				} else if !strings.HasPrefix(arg, "-") && worktreeBranch == "" {
+					worktreeBranch = arg
+				}
+			}
+
+			if worktreeBranch == "" {
+				fmt.Fprintln(os.Stderr, "Error: worktree requires a branch name")
 				os.Exit(1)
 			}
-		default:
-			if !strings.HasPrefix(arg, "-") {
-				searchTerm += arg + " "
+		}
+	}
+
+	// Check for init command
+	if len(args) >= 1 && args[0] == "init" {
+		initMode = true
+		if len(args) >= 2 && !strings.HasPrefix(args[1], "-") {
+			initPath = args[1]
+		}
+	}
+
+	// Standard argument parsing (if not worktree or init mode)
+	if !worktreeMode && !initMode {
+		for i := 0; i < len(args); i++ {
+			arg := args[i]
+			switch arg {
+			case "--help", "-h", "help":
+				showHelp = true
+			case "--version", "-v":
+				showVersion = true
+			case "--select-only", "-s":
+				selectOnly = true
+			case "--clone", "-c":
+				// Get the next argument as the URL
+				if i+1 < len(args) {
+					cloneURL = args[i+1]
+					i++ // Skip the URL argument
+				} else {
+					fmt.Fprintln(os.Stderr, "Error: --clone requires a URL argument")
+					os.Exit(1)
+				}
+			default:
+				if !strings.HasPrefix(arg, "-") {
+					searchTerm += arg + " "
+				}
 			}
 		}
 	}
@@ -1372,6 +2323,18 @@ func main() {
 
 	if showHelp {
 		printHelp(config)
+		return
+	}
+
+	// Handle init command
+	if initMode {
+		handleInitCommand(initPath, config)
+		return
+	}
+
+	// Handle worktree operation
+	if worktreeMode {
+		handleDirectWorktree(worktreeRepo, worktreeBranch, worktreeInRepo, config)
 		return
 	}
 
@@ -1505,7 +2468,7 @@ func main() {
 			}
 
 		case "clone":
-			// Clone GitHub repository
+			// Clone git repository
 			cloneURL := m.selected.CloneURL
 
 			// Perform the clone
@@ -1542,6 +2505,47 @@ func main() {
 				fmt.Fprintf(os.Stderr, "Error launching shell: %v\n", err)
 				os.Exit(1)
 			}
+
+		case "rename":
+			// Rename directory
+			if err := os.Rename(m.selected.OldPath, m.selected.Path); err != nil {
+				fmt.Fprintf(os.Stderr, "Error renaming directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Touch the renamed directory
+			if err := os.Chtimes(m.selected.Path, time.Now(), time.Now()); err != nil {
+				if !selectOnly {
+					fmt.Fprintf(os.Stderr, "Warning: couldn't update access time: %v\n", err)
+				}
+			}
+
+			if selectOnly {
+				fmt.Println(m.selected.Path)
+				os.Exit(0)
+			}
+
+			// Change to the renamed directory
+			if err := os.Chdir(m.selected.Path); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: couldn't change directory: %v\n", err)
+				os.Exit(1)
+			}
+
+			// Launch a new shell
+			shell := getShell(m.config)
+
+			fmt.Printf("\n📝 Renamed to %s\n\n", filepath.Base(m.selected.Path))
+
+			cmd := exec.Command(shell)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			cmd.Dir = m.selected.Path
+
+			if err := cmd.Run(); err != nil {
+				fmt.Fprintf(os.Stderr, "Error launching shell: %v\n", err)
+				os.Exit(1)
+			}
 		}
 	}
 }
@@ -1564,25 +2568,46 @@ Perfect for people with ADHD who need quick, organized workspaces.
 USAGE:
   try [search_term]           Launch selector with optional search
   try --select-only, -s       Output selected path instead of launching shell
-  try --clone <github-url>    Clone a GitHub repository
+  try --clone <git-url>       Clone a git repository
   try --version, -v           Show version information
   try --help                  Show this help
+
+GIT WORKTREE:
+  try worktree <branch>       Create worktree in TRY_PATH (date-prefixed)
+  try . <branch>              Shorthand for worktree (current repo)
+  try ./path <branch>         Create worktree from specific repo
+  try worktree --in-repo <b>  Create in .worktrees/ inside repo (GT-style)
+  try . --in-repo <branch>    Shorthand with GT-style location
+
+SHELL INTEGRATION:
+  try init                    Generate shell wrapper for cd integration
+  try init /path/to/try       Generate wrapper with custom binary path
 
 FEATURES:
   • Fuzzy search with smart scoring
   • Automatic date prefixing (YYYY-MM-DD)
   • Time-based sorting (recent = higher)
-  • GitHub repository cloning
+  • Git repository cloning (GitHub, GitLab, Bitbucket, etc.)
+  • Git worktree support (GT-compatible)
+  • Directory renaming
 
 NAVIGATION:
   ↑/↓          Navigate entries
   Ctrl+j/k     Navigate entries (vim-style)
   Enter        Select directory or create new
-  Ctrl+N       Create new experiment (quick)
-  Ctrl+D       Delete selected directory
+  Ctrl+N/T     Create new experiment (quick)
+  Ctrl+D       Toggle mark for deletion (batch delete mode)
+  Ctrl+R       Rename selected directory
   Backspace    Delete search character
   Ctrl+U       Clear search
-  ESC or q     Cancel and exit
+  ESC          Cancel and exit
+
+TEXT EDITING (in search/input modes):
+  Ctrl+A       Move cursor to beginning
+  Ctrl+E       Move cursor to end
+  Ctrl+B/←     Move cursor backward
+  Ctrl+F/→     Move cursor forward
+  Ctrl+W       Delete word backward
 
 CONFIGURATION:
   Environment variables (override config file):
@@ -1597,9 +2622,14 @@ EXAMPLES:
   try neural                               # Launch with search for "neural"
   try new project                          # Search for "new project"
   try github.com/user/repo                 # Shows clone option in TUI
+  try gitlab.com/user/repo                 # GitLab clone option
   try --clone https://github.com/user/repo # Clone directly
+  try --clone git@gitlab.com:user/repo.git # Clone via SSH
   try -s                                   # Select and output path
   cd $(try -s)                             # Use with cd in current shell
+  try . feature/my-branch                  # Create worktree for branch
+  try . --in-repo main                     # GT-style worktree in .worktrees/
+  try init                                 # Generate shell wrapper
 
 First launch automatically creates the base directory.
 Selected directories open in a new shell session.
